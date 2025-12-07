@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>FitFilesFixer.Web</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Use the Dynastream portable package if you rely on the legacy SDK DLL.
+         If you prefer Garmin.FIT.Sdk replace this package accordingly. -->
+    <PackageReference Include="Dynastream.Fit.Portable.dll" Version="1.0.1" />
+  </ItemGroup>
+</Project>
