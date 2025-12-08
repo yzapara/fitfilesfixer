@@ -26,7 +26,7 @@ app.MapGet("/", () =>
         </form>
     </body>
     </html>";
-    
+
     return Results.Content(html, "text/html; charset=utf-8");
 });
 
@@ -67,13 +67,16 @@ app.MapPost("/process", async (HttpRequest request) =>
 
     var originalName = Path.GetFileNameWithoutExtension(file.FileName);
     var extension = Path.GetExtension(file.FileName);
+    
+    var uniqueId = Guid.NewGuid().ToString(); 
     var outputName = $"{originalName}_fixed{extension}";
+    var savedFileName = $"{outputName}.{uniqueId}";
 
     // Save to temp
     var tmpDir = Path.Combine(Path.GetTempPath(), "fiteditor");
     Directory.CreateDirectory(tmpDir);
     var inputPath = Path.Combine(tmpDir, "activity.fit");
-    var outputPath = Path.Combine(tmpDir, outputName);
+    var outputPath = Path.Combine(tmpDir, savedFileName);
 
     await using (var fs = File.Create(inputPath))
         await file.CopyToAsync(fs);
@@ -129,7 +132,6 @@ app.MapPost("/process", async (HttpRequest request) =>
         int? lastValidLat = null;
         int? lastValidLon = null;
 
-        
 
         for (int i = 0; i < messages.Count; i++)
         {
@@ -196,7 +198,7 @@ app.MapPost("/process", async (HttpRequest request) =>
     }
 
     // RETURN THE OUTPUT FILE
-    var downloadUrl = $"/download?file={Uri.EscapeDataString(outputName)}";
+    var downloadUrl = $"/download?file={Uri.EscapeDataString(savedFileName)}&name={Uri.EscapeDataString(outputName)}";
 
     var htmlSuccess = $@"
 <html>
@@ -219,18 +221,24 @@ app.MapPost("/process", async (HttpRequest request) =>
 
 app.MapGet("/download", (HttpRequest request) =>
 {
-    var fileName = request.Query["file"].ToString();
-    if (string.IsNullOrEmpty(fileName))
-        return Results.BadRequest("Missing file parameter.");
+    // The name of the file *on disk* (e.g., activity_fixed.fit.GUID)
+    var savedFileName = request.Query["file"].ToString();
+    
+    // The name the *user* should see (e.g., activity_fixed.fit)
+    var userFileName = request.Query["name"].ToString(); 
+
+    if (string.IsNullOrEmpty(savedFileName) || string.IsNullOrEmpty(userFileName))
+        return Results.BadRequest("Missing file or name parameter.");
 
     var tmpDir = Path.Combine(Path.GetTempPath(), "fiteditor");
-    var filePath = Path.Combine(tmpDir, fileName);
+    var filePath = Path.Combine(tmpDir, savedFileName);
 
     if (!File.Exists(filePath))
         return Results.NotFound("File not found.");
 
     var stream = File.OpenRead(filePath);
-    return Results.File(stream, "application/octet-stream", fileName);
+
+    return Results.File(stream, "application/octet-stream", userFileName, enableRangeProcessing: false);
 });
 
 app.Run();
