@@ -1,7 +1,8 @@
 # Define variables for clarity and easy maintenance
-$projectDir = "C:\Users\Yevhen\RiderProjects\fitfilesfixer\FitFilesFixer.Web"
-$publishDir = "$projectDir\publish"
-$sshKey = "C:\Users\Yevhen\Documents\RoboDreams\ubuntu_rsa.pem"
+$scriptDir = $PSScriptRoot                   # folder where Deploy.ps1 lives (SSH key is here)
+$projectDir = $PSCommandPath | Split-Path -Parent  # same as $PSScriptRoot; script runs from project folder
+$publishDir = Join-Path $projectDir "publish"
+$sshKey = Join-Path $scriptDir "ubuntu_rsa.pem"
 $remoteUser = "ubuntu"
 $remoteHost = "3.72.38.57"
 $remotePath = "~/app/"
@@ -9,7 +10,6 @@ $serviceName = "fitfiles.service"
 
 # --- Stage 1: Publish the .NET application ---
 Write-Host "1/3: Publishing the .NET application..."
-cd $projectDir
 dotnet publish -c Release -o publish
 
 if ($LASTEXITCODE -ne 0) {
@@ -19,7 +19,6 @@ if ($LASTEXITCODE -ne 0) {
 
 # --- Stage 2: Securely copy the published files to the remote server using SCP ---
 Write-Host "2/3: Copying files to ${remoteUser}@${remoteHost}:${remotePath} ..."
-# NOTE: Using ${} braces to correctly handle the ':' and '@' characters
 scp -i $sshKey -r "$publishDir\*" "${remoteUser}@${remoteHost}:${remotePath}"
 
 if ($LASTEXITCODE -ne 0) {
