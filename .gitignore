@@ -32,6 +32,7 @@ nupkg/
 [Dd]ebugPublic/
 [Rr]elease/
 [Rr]eleases/
+[Pp]ublish/
 x64/
 x86/
 build/
