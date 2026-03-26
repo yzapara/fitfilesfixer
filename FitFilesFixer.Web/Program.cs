@@ -1,3 +1,4 @@
+﻿using Microsoft.AspNetCore.HttpOverrides;
 ﻿using System.Diagnostics;
 using System.Net;
 using System.Text.Json;
@@ -11,6 +12,12 @@ using File = System.IO.File;
 SQLitePCL.Batteries.Init();
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.Configure<ForwardedHeadersOptions>(options => {
+    options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+    options.KnownNetworks.Clear();
+    options.KnownProxies.Clear();
+});
 builder.WebHost.UseUrls("http://*:5000");
 
 builder.Services.AddHttpClient("geo", c =>
@@ -21,6 +28,7 @@ builder.Services.AddHttpClient("geo", c =>
 
 const string validApiKey = "RUSNI_PYZDA";
 var app = builder.Build();
+app.UseForwardedHeaders();
 
 string GetConnectionString()
 {
@@ -148,6 +156,7 @@ function handleSubmit() {{
 }}
 </script>
 
+{SharedCss.Footer(lang)}
 </body></html>";
 
     return Results.Content(html, "text/html; charset=utf-8");
@@ -170,9 +179,7 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
 
     string T(string k) => Lang.T(k, lang);
 
-    var clientIp = request.Headers["X-Forwarded-For"].FirstOrDefault()?.Split(',')[0].Trim()
-                   ?? request.HttpContext.Connection.RemoteIpAddress?.ToString()
-                   ?? "unknown";
+    var clientIp = request.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
 
     // ---- API KEY CHECK ----
     var apiKey = form["apiKey"].ToString();
@@ -204,6 +211,7 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
 <h2 style='color:red'>{T("denied.heading")}</h2>
 <p>{T("denied.body")}</p>
 <a href='/?lang={lang}'>{T("denied.back")}</a>
+{SharedCss.Footer(lang)}
 </body></html>";
         return Results.Content(deniedHtml, "text/html; charset=utf-8", statusCode: 401);
     }
@@ -435,6 +443,7 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
   <a class='btn-secondary' href='/?lang={lang}'>{T("result.upload_another")}</a>
 </div>
 
+{SharedCss.Footer(lang)}
 </body>
 </html>";
 
@@ -481,6 +490,8 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response) =>
             SUM(total_points)                                           AS sum_points,
             SUM(fixed_points)                                           AS sum_fixed
         FROM requests");
+    
+    var uniqueIps = conn.QuerySingle(@"SELECT COUNT(DISTINCT ip) AS cnt FROM requests");
 
     var byCountry = conn.QueryRows(@"
         SELECT COALESCE(country, 'Unknown') AS country, COUNT(*) AS cnt
@@ -551,6 +562,8 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response) =>
   <div class='stat-kpi'><div class='val'>{N(summary["avg_ms"])} ms</div><div class='lbl'>{T("stats.avg_ms")}</div></div>
   <div class='stat-kpi'><div class='val'>{N(summary["sum_points"])}</div><div class='lbl'>{T("stats.sum_points")}</div></div>
   <div class='stat-kpi'><div class='val'>{N(summary["sum_fixed"])}</div><div class='lbl'>{T("stats.sum_fixed")}</div></div>
+  <div class='stat-kpi'><div class='val'>{uniqueIps["cnt"]}</div><div class='lbl'>Unique IPs</div></div>
+
 </div>
 
 <hr/>
@@ -576,10 +589,24 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response) =>
   {historyRows}
 </table>
 
+{SharedCss.Footer(lang)}
 </body>
 </html>";
 
     return Results.Content(html, "text/html; charset=utf-8");
+});
+
+// TEMP ADMIN CLEANUP ENDPOINT
+app.MapPost("/admin/cleanup-ipv6", (HttpRequest request) =>
+{
+    using var conn = new SqliteConnection(GetConnectionString());
+    conn.Open();
+
+    var cmd = conn.CreateCommand();
+    cmd.CommandText = @"DELETE FROM requests WHERE ip LIKE '::ffff:%';";
+    var count = cmd.ExecuteNonQuery();
+
+    return Results.Ok($"Deleted {count} rows with ::ffff: prefix");
 });
 
 app.Run();
@@ -593,6 +620,32 @@ app.Run();
 // ---------------------------------------------------------------------------
 static class SharedCss
 {
+    public static string Footer(string lang) => lang == "uk"
+        ? @"<div class='donate-footer'>
+  <a class='donate-banner' href='https://defensivewave.org/' target='_blank' rel='noopener'>
+    <div class='donate-banner-left'>
+      <div class='donate-flag'>🇺🇦</div>
+      <div class='donate-text'>
+        <strong>Підтримай захист України</strong>
+        <span>Задонать на українську армію через Defensive Wave</span>
+      </div>
+    </div>
+    <div class='donate-btn'>Задонатити →</div>
+  </a>
+</div>"
+        : @"<div class='donate-footer'>
+  <a class='donate-banner' href='https://defensivewave.org/' target='_blank' rel='noopener'>
+    <div class='donate-banner-left'>
+      <div class='donate-flag'>🇺🇦</div>
+      <div class='donate-text'>
+        <strong>Support Ukraine's Defence</strong>
+        <span>Donate to the Ukrainian army via Defensive Wave</span>
+      </div>
+    </div>
+    <div class='donate-btn'>Donate now →</div>
+  </a>
+</div>";
+
     public const string Css = @"
   body { font-family: sans-serif; padding: 32px 24px; max-width: 760px; margin: 0 auto; color: #111; background: #fff; }
   h1 { font-size: 20px; font-weight: 500; margin: 0 0 4px; }
@@ -639,7 +692,16 @@ static class SharedCss
   tr:nth-child(even) { background: #fafafa; }
   .stat-kpi { display: inline-block; background:#f5f5f5; border:1px solid #ddd; border-radius:6px; padding:12px 24px; margin:6px; text-align:center; }
   .stat-kpi .val { font-size:2em; font-weight:bold; }
-  .stat-kpi .lbl { font-size:0.8em; color:#666; }";
+  .stat-kpi .lbl { font-size:0.8em; color:#666; }
+  .donate-footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid #eee; }
+  .donate-banner { display: flex; align-items: center; justify-content: space-between; gap: 16px; background: #0057b8; border-radius: 10px; padding: 16px 20px; text-decoration: none; flex-wrap: wrap; }
+  .donate-banner:hover { opacity: 0.93; }
+  .donate-banner-left { display: flex; align-items: center; gap: 12px; }
+  .donate-flag { font-size: 24px; flex-shrink: 0; }
+  .donate-text { color: #fff; }
+  .donate-text strong { display: block; font-size: 15px; font-weight: 500; }
+  .donate-text span { font-size: 13px; opacity: 0.85; }
+  .donate-btn { background: #ffd700; color: #0057b8; font-size: 13px; font-weight: 500; border-radius: 6px; padding: 8px 18px; white-space: nowrap; flex-shrink: 0; }";
 }
 
 // ---------------------------------------------------------------------------
