@@ -1,5 +1,5 @@
 ﻿using Microsoft.AspNetCore.HttpOverrides;
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Net;
 using System.Text.Json;
 using Dynastream.Fit;
@@ -490,7 +490,7 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response) =>
             SUM(total_points)                                           AS sum_points,
             SUM(fixed_points)                                           AS sum_fixed
         FROM requests");
-    
+
     var uniqueIps = conn.QuerySingle(@"SELECT COUNT(DISTINCT ip) AS cnt FROM requests");
 
     var byCountry = conn.QueryRows(@"
@@ -501,7 +501,8 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response) =>
         LIMIT 20");
 
     var rows = conn.QueryRows(@"
-        SELECT timestamp, ip, country, city, file_name, file_size_kb,
+        SELECT strftime('%d.%m.%Y %H:%M', timestamp) AS timestamp,
+               ip, country, city, file_name, file_size_kb,
                total_points, fixed_points, processing_ms, success, error_message
         FROM requests
         ORDER BY id DESC
@@ -562,8 +563,7 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response) =>
   <div class='stat-kpi'><div class='val'>{N(summary["avg_ms"])} ms</div><div class='lbl'>{T("stats.avg_ms")}</div></div>
   <div class='stat-kpi'><div class='val'>{N(summary["sum_points"])}</div><div class='lbl'>{T("stats.sum_points")}</div></div>
   <div class='stat-kpi'><div class='val'>{N(summary["sum_fixed"])}</div><div class='lbl'>{T("stats.sum_fixed")}</div></div>
-  <div class='stat-kpi'><div class='val'>{uniqueIps["cnt"]}</div><div class='lbl'>Unique IPs</div></div>
-
+  <div class='stat-kpi'><div class='val'>{N(uniqueIps["cnt"])}</div><div class='lbl'>{T("stats.unique_ips")}</div></div>
 </div>
 
 <hr/>
@@ -596,16 +596,16 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response) =>
     return Results.Content(html, "text/html; charset=utf-8");
 });
 
-// TEMP ADMIN CLEANUP ENDPOINT
+// ---------------------------------------------------------------------------
+// POST /admin/cleanup-ipv6  — one-off maintenance helper
+// ---------------------------------------------------------------------------
 app.MapPost("/admin/cleanup-ipv6", (HttpRequest request) =>
 {
     using var conn = new SqliteConnection(GetConnectionString());
     conn.Open();
-
     var cmd = conn.CreateCommand();
     cmd.CommandText = @"DELETE FROM requests WHERE ip LIKE '::ffff:%';";
     var count = cmd.ExecuteNonQuery();
-
     return Results.Ok($"Deleted {count} rows with ::ffff: prefix");
 });
 
@@ -780,6 +780,7 @@ function setLang(l){{
         ["stats.avg_ms"]         = new() { ["en"] = "Avg processing time",        ["uk"] = "Сер. час обробки" },
         ["stats.sum_points"]     = new() { ["en"] = "Total points processed",     ["uk"] = "Всього точок оброблено" },
         ["stats.sum_fixed"]      = new() { ["en"] = "Total points fixed",         ["uk"] = "Всього точок виправлено" },
+        ["stats.unique_ips"]     = new() { ["en"] = "Unique IPs",                 ["uk"] = "Унікальних IP" },
         ["stats.by_country"]     = new() { ["en"] = "Requests by country",        ["uk"] = "Запити за країнами" },
         ["stats.country"]        = new() { ["en"] = "Country",                    ["uk"] = "Країна" },
         ["stats.requests"]       = new() { ["en"] = "Requests",                   ["uk"] = "Запити" },
