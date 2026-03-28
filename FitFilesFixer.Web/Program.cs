@@ -5,7 +5,7 @@ using System.Net;
 using System.Text.Json;
 using Dynastream.Fit;
 using Microsoft.Data.Sqlite;
-using FitFilesFixer.Web.Data;
+using FitFilesFixer.Web.DataAccess;
 using FitFilesFixer.Web.Infrastructure;
 using FitFilesFixer.Web.Models;
 using FitFilesFixer.Web.Services;
