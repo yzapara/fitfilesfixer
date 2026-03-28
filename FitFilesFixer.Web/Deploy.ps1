@@ -16,7 +16,8 @@ $serviceName = "fitfiles"
 # --- PUBLISH ---
 Write-Host "1/5: Publishing..."
 Remove-Item -Recurse -Force $publishDir -ErrorAction SilentlyContinue
-dotnet publish "$projectDir" -c Release -o "$publishDir"
+$projectFile = Join-Path $projectDir "FitFilesFixer.csproj"
+dotnet publish "$projectFile" -c Release -o "$publishDir"
 if ($LASTEXITCODE -ne 0) { Write-Error "dotnet publish failed"; exit 1 }
 
 # --- CREATE REMOTE FOLDERS ---
