@@ -65,6 +65,28 @@ string GetConnectionString()
     return $"Data Source={defaultPath}";
 }
 
+static void CleanupTempFiles(string directory, TimeSpan maxAge)
+{
+    try
+    {
+        if (!Directory.Exists(directory))
+            return;
+
+        var cutoff = System.DateTime.UtcNow - maxAge;
+        foreach (var filePath in Directory.EnumerateFiles(directory))
+        {
+            try
+            {
+                var fi = new FileInfo(filePath);
+                if (fi.LastWriteTimeUtc < cutoff)
+                    fi.Delete();
+            }
+            catch { /* ignore file-level cleanup errors */ }
+        }
+    }
+    catch { /* ignore cleanup errors */ }
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/geolocate  — returns best-guess city for the caller's IP
 // ---------------------------------------------------------------------------
@@ -337,6 +359,7 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
     var extension     = Path.GetExtension(file.FileName);
 
     var tmpDir = Path.Combine(Path.GetTempPath(), "fiteditor");
+    CleanupTempFiles(tmpDir, TimeSpan.FromDays(7));
     Directory.CreateDirectory(tmpDir);
     var uploadId = Guid.NewGuid().ToString("N");
     var savedUploadName = $"upload_{uploadId}{extension}";
@@ -577,7 +600,7 @@ app.MapGet("/download", (HttpRequest request) =>
     if (!File.Exists(filePath))
         return Results.NotFound("File not found.");
 
-    var stream = File.OpenRead(filePath);
+    var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 8192, FileOptions.DeleteOnClose);
     return Results.File(stream, "application/octet-stream", userFileName, enableRangeProcessing: false);
 });
 
@@ -596,7 +619,7 @@ app.MapGet("/download-original", (HttpRequest request) =>
     if (!File.Exists(filePath))
         return Results.NotFound("File not found.");
 
-    var stream = File.OpenRead(filePath);
+    var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 8192, FileOptions.DeleteOnClose);
     return Results.File(stream, "application/octet-stream", userFileName, enableRangeProcessing: false);
 });
 
