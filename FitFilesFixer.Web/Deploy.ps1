@@ -39,21 +39,22 @@ if ($LASTEXITCODE -ne 0) { Write-Error "rsync failed"; exit 1 }
 
 # --- DATABASE MIGRATION ---
 Write-Host "4/5: Running remote DB migration (saved_file_name column)..."
-ssh -i $sshKey "$remoteUser@$remoteHost" "
-    DB=\"$remotePath/data/fitfiles.db\"; 
-    if [ ! -f \"$remotePath/data/fitfiles.db\" ]; then echo 'DB not found, skipping migration'; exit 0; fi; 
-    hascol=\\$(sqlite3 \"$remotePath/data/fitfiles.db\" 'PRAGMA table_info(requests);' | cut -d\\'|\\' -f2 | grep -x 'saved_file_name' | wc -l); 
-    if [ \$hascol -eq 1 ]; then
-        echo 'Column already exists; skipping one-time cleanup.';
+$dbMigrationScript = @"
+    DB=$remotePath/data/fitfiles.db
+    if [ ! -f "`$DB" ]; then echo 'DB not found, skipping migration'; exit 0; fi
+    hascol=`$(sqlite3 "`$DB" 'PRAGMA table_info(requests);' | cut -d'|' -f2 | grep -x 'saved_file_name' | wc -l)
+    if [ `$hascol -eq 1 ]; then
+        echo 'Column already exists; skipping one-time cleanup.'
     else
-        sqlite3 \"$remotePath/data/fitfiles.db\" 'ALTER TABLE requests ADD COLUMN saved_file_name TEXT;' && echo 'Column added';
-        echo 'Running one-time cleanup of stale /tmp/fiteditor files...';
-        TMPDIR='/tmp/fiteditor'; 
-        mkdir -p \"$TMPDIR\"; 
-        find \"$TMPDIR\" -maxdepth 1 -type f -mtime +7 -print -delete || true; 
-        find \"$TMPDIR\" -maxdepth 1 -type d -mtime +7 -print -exec rm -rf {} \; || true;
+        sqlite3 "`$DB" 'ALTER TABLE requests ADD COLUMN saved_file_name TEXT;' && echo 'Column added'
+        echo 'Running one-time cleanup of stale /tmp/fiteditor files...'
+        TMPDIR='/tmp/fiteditor'
+        mkdir -p "`$TMPDIR"
+        find "`$TMPDIR" -maxdepth 1 -type f -mtime +7 -print -delete || true
+        find "`$TMPDIR" -maxdepth 1 -type d -mtime +7 -print -exec rm -rf {} \; || true
     fi
-"
+"@
+ssh -i $sshKey "$remoteUser@$remoteHost" $dbMigrationScript
 if ($LASTEXITCODE -ne 0) { Write-Error "DB migration failed"; exit 1 }
 
 # --- RESTART SERVICE ---
