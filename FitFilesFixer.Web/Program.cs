@@ -382,7 +382,6 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
         {
             Ip = clientIp,
             FileName = file.FileName,
-            SavedFileName = savedUploadName,
             FileSizeKb = (int)(file.Length / 1024),
             TotalPoints = result.TotalPoints,
             FixedPoints = result.FixedPoints,
@@ -392,6 +391,9 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
             Success = true,
             ProcessingMs = (int)sw.ElapsedMilliseconds
         });
+
+        // Delete the uploaded file after successful processing
+        File.Delete(savedUploadPath);
     }
     catch (Exception ex)
     {
@@ -649,9 +651,10 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
     var historyRows = string.Concat(rows.Select(r => {
         var saved = N(r["saved_file_name"]);
         var fileName = N(r["file_name"]);
-        var downloadLink = string.IsNullOrEmpty(saved) || saved == "-"
-            ? fileName
-            : $"<a href='/download-original?file={Uri.EscapeDataString(saved)}&name={Uri.EscapeDataString(fileName)}'>{T("stats.col_download")}</a>";
+        var success = N(r["success"]) == "1";
+        var downloadLink = !success && !string.IsNullOrEmpty(saved) && saved != "-"
+            ? $"<a href='/download-original?file={Uri.EscapeDataString(saved)}&name={Uri.EscapeDataString(fileName)}'>{T("stats.col_download")}</a>"
+            : fileName;
 
         return $@"
         <tr>
