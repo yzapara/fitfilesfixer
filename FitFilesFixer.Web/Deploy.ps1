@@ -54,7 +54,7 @@ $dbMigrationScript = @"
         find "`$TMPDIR" -maxdepth 1 -type d -mtime +7 -print -exec rm -rf {} \; || true
     fi
 "@
-$dbMigrationScript | ssh -i $sshKey "$remoteUser@$remoteHost" bash
+$dbMigrationScript.Trim() | ssh -i $sshKey "$remoteUser@$remoteHost" bash
 if ($LASTEXITCODE -ne 0) { Write-Error "DB migration failed"; exit 1 }
 
 # --- RESTART SERVICE ---
