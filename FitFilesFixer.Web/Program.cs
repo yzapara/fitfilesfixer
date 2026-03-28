@@ -640,7 +640,7 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
 
     var summary = requestLogRepository.GetSummary(GetConnectionString());
     var uniqueIps = new Dictionary<string, object?> { ["cnt"] = requestLogRepository.GetUniqueIpCount(GetConnectionString()) };
-    var byCountry = requestLogRepository.GetRequestsByCountry(GetConnectionString());
+    var byCity = requestLogRepository.GetRequestsByCity(GetConnectionString());
     var rows = requestLogRepository.GetLastRequests(GetConnectionString());
 
     static string N(object? v) => v?.ToString() ?? "-";
@@ -649,8 +649,8 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
             ? "<span style='color:green'>✓</span>"
             : "<span style='color:red'>✗</span>";
 
-    var countryRows = string.Concat(byCountry.Select(r =>
-        $"<tr><td>{N(r["country"])}</td><td>{N(r["cnt"])}</td></tr>"));
+    var cityRows = string.Concat(byCity.Select(r =>
+        $"<tr><td>{N(r["city"])}</td><td>{N(r["cnt"])}</td></tr>"));
 
     var historyRows = string.Concat(rows.Select(r => {
         var saved = N(r["saved_file_name"]);
@@ -658,7 +658,7 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
         var success = N(r["success"]) == "1";
         var downloadLink = !success && !string.IsNullOrEmpty(saved) && saved != "-"
             ? $"<a href='/download-original?file={Uri.EscapeDataString(saved)}&name={Uri.EscapeDataString(fileName)}'>{T("stats.col_download")}</a>"
-            : fileName;
+            : "-";
 
         return $@"
         <tr>
@@ -666,6 +666,7 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
             <td>{N(r["ip"])}</td>
             <td>{N(r["country"])}</td>
             <td>{N(r["city"])}</td>
+            <td>{fileName}</td>
             <td>{downloadLink}</td>
             <td>{N(r["file_size_kb"])} KB</td>
             <td>{N(r["total_points"])}</td>
@@ -712,10 +713,10 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
 
 <hr/>
 
-<p class='section-label'>{T("stats.by_country")}</p>
+<p class='section-label'>{T("stats.by_city")}</p>
 <table>
-  <tr><th>{T("stats.country")}</th><th>{T("stats.requests")}</th></tr>
-  {countryRows}
+  <tr><th>{T("stats.city")}</th><th>{T("stats.requests")}</th></tr>
+  {cityRows}
 </table>
 
 <hr/>
@@ -725,9 +726,9 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
   <tr>
     <th>{T("stats.col_time")}</th><th>{T("stats.col_ip")}</th>
     <th>{T("stats.col_country")}</th><th>{T("stats.col_city")}</th>
-    <th>{T("stats.col_file")}</th><th>{T("stats.col_size")}</th><th>{T("stats.col_download")}</th>
+    <th>{T("stats.col_file")}</th><th>{T("stats.col_download")}</th><th>{T("stats.col_size")}</th>
     <th>{T("stats.col_points")}</th><th>{T("stats.col_fixed")}</th>
-    <th>{T("stats.col_time2")}</th><th>{T("stats.col_ok")}</th>
+    <th>{T("stats.col_duration")}</th><th>{T("stats.col_ok")}</th>
     <th>{T("stats.col_error")}</th>
   </tr>
   {historyRows}

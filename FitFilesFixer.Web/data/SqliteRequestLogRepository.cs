@@ -123,6 +123,18 @@ public class SqliteRequestLogRepository : IRequestLogRepository
             LIMIT {limit}");
     }
 
+    public List<Dictionary<string, object?>> GetRequestsByCity(string connectionString, int limit = 20)
+    {
+        using var conn = new SqliteConnection(connectionString);
+        conn.Open();
+        return conn.QueryRows($@"
+            SELECT COALESCE(city, 'Unknown') AS city, COUNT(*) AS cnt
+            FROM requests
+            GROUP BY city
+            ORDER BY cnt DESC
+            LIMIT {limit}");
+    }
+
     public List<Dictionary<string, object?>> GetLastRequests(string connectionString, int limit = 50)
     {
         using var conn = new SqliteConnection(connectionString);

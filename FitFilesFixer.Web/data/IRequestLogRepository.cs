@@ -9,5 +9,6 @@ public interface IRequestLogRepository
     Dictionary<string, object?> GetSummary(string connectionString);
     int GetUniqueIpCount(string connectionString);
     List<Dictionary<string, object?>> GetRequestsByCountry(string connectionString, int limit = 20);
+    List<Dictionary<string, object?>> GetRequestsByCity(string connectionString, int limit = 20);
     List<Dictionary<string, object?>> GetLastRequests(string connectionString, int limit = 50);
 }
