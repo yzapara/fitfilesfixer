@@ -405,6 +405,9 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
     }
     catch (Exception ex)
     {
+        var fileNameEscaped = WebUtility.HtmlEncode(file.FileName);
+        var fileNameDisplay = TruncateFileName(file.FileName);
+
         await requestLogService.LogAsync(GetConnectionString(), new RequestLog
         {
             Ip = clientIp,
@@ -439,7 +442,7 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
 <h2 style='color:red'>{T("result.error_heading")}</h2>
 <p>{T("result.error_body")}</p>
 <ul>
-  <li>{T("stats.col_file")}: {file.FileName}</li>
+  <li>{T("stats.col_file")}: <span title='{fileNameEscaped}'>{fileNameDisplay}</span></li>
   <li>{T("stats.col_size")}: {(file.Length / 1024)} KB</li>
   <li>{T("result.error_message")}: {WebUtility.HtmlEncode(ex.Message)}</li>
 </ul>
@@ -456,6 +459,8 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
     sw.Stop();
 
     var outputName = result.OutputName;
+    var outputNameEscaped = WebUtility.HtmlEncode(outputName);
+    var outputNameDisplay = TruncateFileName(outputName);
     var savedFileName = Path.GetFileName(result.OutputPath);
 
     var totalPoints = result.TotalPoints;
@@ -556,7 +561,7 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
       </svg>
     </div>
     <div>
-      <h1>{originalName}{extension}</h1>
+      <h1><span title='{outputNameEscaped}'>{outputNameDisplay}</span></h1>
       <p class='sub'>{string.Format(T("result.sub"), sw.ElapsedMilliseconds)}</p>
     </div>
   </div>
@@ -580,7 +585,7 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
 </div>
 
 <div class='actions'>
-  <a class='btn-primary' href='{downloadUrl}' download>{string.Format(T("result.download"), outputName)}</a>
+  <a class='btn-primary' href='{downloadUrl}' download title='{outputNameEscaped}'>{string.Format(T("result.download"), outputNameDisplay)}</a>
   <a class='btn-secondary' href='/?lang={lang}'>{T("result.upload_another")}</a>
 </div>
 
@@ -648,16 +653,6 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
         v?.ToString() == "1"
             ? "<span style='color:green'>✓</span>"
             : "<span style='color:red'>✗</span>";
-
-    static string TruncateFileName(string name, int maxLen = 36)
-    {
-        if (string.IsNullOrEmpty(name) || name.Length <= maxLen)
-            return WebUtility.HtmlEncode(name ?? "-");
-
-        var prefix = name.Substring(0, maxLen / 2 - 1);
-        var suffix = name.Substring(name.Length - (maxLen / 2 - 1));
-        return WebUtility.HtmlEncode(prefix + "…" + suffix);
-    }
 
     var cityRows = string.Concat(byCity.Select(r =>
         $"<tr><td>{N(r["city"])}</td><td>{N(r["cnt"])}</td></tr>"));
@@ -769,6 +764,16 @@ app.MapPost("/admin/cleanup-ipv6", (HttpRequest request) =>
     var count = cmd.ExecuteNonQuery();
     return Results.Ok($"Deleted {count} rows with ::ffff: prefix");
 });
+
+static string TruncateFileName(string name, int maxLen = 36)
+{
+    if (string.IsNullOrEmpty(name) || name.Length <= maxLen)
+        return WebUtility.HtmlEncode(name ?? "-");
+
+    var prefix = name.Substring(0, maxLen / 2 - 1);
+    var suffix = name.Substring(name.Length - (maxLen / 2 - 1));
+    return WebUtility.HtmlEncode(prefix + "…" + suffix);
+}
 
 app.Run();
 
