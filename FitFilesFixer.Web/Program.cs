@@ -649,6 +649,16 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
             ? "<span style='color:green'>✓</span>"
             : "<span style='color:red'>✗</span>";
 
+    static string TruncateFileName(string name, int maxLen = 36)
+    {
+        if (string.IsNullOrEmpty(name) || name.Length <= maxLen)
+            return WebUtility.HtmlEncode(name ?? "-");
+
+        var prefix = name.Substring(0, maxLen / 2 - 1);
+        var suffix = name.Substring(name.Length - (maxLen / 2 - 1));
+        return WebUtility.HtmlEncode(prefix + "…" + suffix);
+    }
+
     var cityRows = string.Concat(byCity.Select(r =>
         $"<tr><td>{N(r["city"])}</td><td>{N(r["cnt"])}</td></tr>"));
 
@@ -660,13 +670,19 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
             ? $"<a href='/download-original?file={Uri.EscapeDataString(saved)}&name={Uri.EscapeDataString(fileName)}'>{T("stats.col_download")}</a>"
             : "-";
 
+        var safeFileName = WebUtility.HtmlEncode(fileName);
+        var displayFileName = fileName == "-" ? "-" : TruncateFileName(fileName);
+        var fileNameCell = fileName == "-"
+            ? "-"
+            : $"<span title='{safeFileName}'>{displayFileName}</span>";
+
         return $@"
         <tr>
             <td>{N(r["timestamp"])}</td>
             <td>{N(r["ip"])}</td>
             <td>{N(r["country"])}</td>
             <td>{N(r["city"])}</td>
-            <td>{fileName}</td>
+            <td>{fileNameCell}</td>
             <td>{downloadLink}</td>
             <td>{N(r["file_size_kb"])} KB</td>
             <td>{N(r["total_points"])}</td>
