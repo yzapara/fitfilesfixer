@@ -42,7 +42,7 @@ Write-Host "4/5: Running remote DB migration (saved_file_name column)..."
 $dbMigrationScript = @"
     DB=$remotePath/data/fitfiles.db
     if [ ! -f "`$DB" ]; then echo 'DB not found, skipping migration'; exit 0; fi
-    hascol=`$(sqlite3 "`$DB" 'PRAGMA table_info(requests);' | cut -d'|' -f2 | grep -x 'saved_file_name' | wc -l)
+    hascol=`$(sqlite3 "`$DB" 'PRAGMA table_info(requests);' | cut -d'|' -f2 | grep -x 'saved_file_name' | wc -l)`
     if [ `$hascol -eq 1 ]; then
         echo 'Column already exists; skipping one-time cleanup.'
     else
