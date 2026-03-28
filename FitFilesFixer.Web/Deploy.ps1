@@ -36,8 +36,19 @@ wsl rsync -avz --delete `
 
 if ($LASTEXITCODE -ne 0) { Write-Error "rsync failed"; exit 1 }
 
+# --- DATABASE MIGRATION ---
+Write-Host "4/5: Running remote DB migration (saved_file_name column)..."
+ssh -i $sshKey "$remoteUser@$remoteHost" "
+    DB=\"$remotePath/data/fitfiles.db\"; 
+    if [ ! -f \"$remotePath/data/fitfiles.db\" ]; then echo 'DB not found, skipping migration'; exit 0; fi; 
+    hascol=
+      \\$(sqlite3 \"$remotePath/data/fitfiles.db\" 'PRAGMA table_info(requests);' | cut -d\\'|\\' -f2 | grep -x 'saved_file_name' | wc -l); 
+    if [ \$hascol -eq 1 ]; then echo 'Column already exists'; else sqlite3 \"$remotePath/data/fitfiles.db\" 'ALTER TABLE requests ADD COLUMN saved_file_name TEXT;' && echo 'Column added'; fi
+"
+if ($LASTEXITCODE -ne 0) { Write-Error "DB migration failed"; exit 1 }
+
 # --- RESTART SERVICE ---
-Write-Host "4/5: Restarting service..."
+Write-Host "5/5: Restarting service..."
 ssh -i $sshKey "$remoteUser@$remoteHost" "sudo systemctl restart $serviceName && sudo systemctl reload nginx"
 if ($LASTEXITCODE -ne 0) { Write-Error "Service restart failed"; exit 1 }
 
