@@ -16,7 +16,8 @@ $serviceName = "fitfiles"
 # --- PUBLISH ---
 Write-Host "1/5: Publishing..."
 Remove-Item -Recurse -Force $publishDir -ErrorAction SilentlyContinue
-dotnet publish "$projectDir" -c Release -o "$publishDir"
+$projectFile = Join-Path $projectDir "FitFilesFixer.csproj"
+dotnet publish "$projectFile" -c Release -o "$publishDir"
 if ($LASTEXITCODE -ne 0) { Write-Error "dotnet publish failed"; exit 1 }
 
 # --- CREATE REMOTE FOLDERS ---
@@ -38,30 +39,38 @@ if ($LASTEXITCODE -ne 0) { Write-Error "rsync failed"; exit 1 }
 
 # --- DATABASE MIGRATION ---
 Write-Host "4/5: Running remote DB migration (saved_file_name column)..."
-ssh -i $sshKey "$remoteUser@$remoteHost" "
-    DB=\"$remotePath/data/fitfiles.db\"; 
-    if [ ! -f \"$remotePath/data/fitfiles.db\" ]; then echo 'DB not found, skipping migration'; exit 0; fi; 
-    hascol=\\$(sqlite3 \"$remotePath/data/fitfiles.db\" 'PRAGMA table_info(requests);' | cut -d\\'|\\' -f2 | grep -x 'saved_file_name' | wc -l); 
-    if [ \$hascol -eq 1 ]; then
-        echo 'Column already exists; skipping one-time cleanup.';
-    else
-        sqlite3 \"$remotePath/data/fitfiles.db\" 'ALTER TABLE requests ADD COLUMN saved_file_name TEXT;' && echo 'Column added';
-        echo 'Running one-time cleanup of stale /tmp/fiteditor files...';
-        TMPDIR='/tmp/fiteditor'; 
-        mkdir -p \"$TMPDIR\"; 
-        find \"$TMPDIR\" -maxdepth 1 -type f -mtime +7 -print -delete || true; 
-        find \"$TMPDIR\" -maxdepth 1 -type d -mtime +7 -print -exec rm -rf {} \; || true;
-    fi
-"
+
+$tmpScript = "$env:TEMP\migrate.sh"
+$dbMigrationScript = @'
+#!/bin/bash
+DB="$1/data/fitfiles.db"
+if [ ! -f "$DB" ]; then echo 'DB not found, skipping migration'; exit 0; fi
+hascol=$(sqlite3 "$DB" 'PRAGMA table_info(requests);' | cut -d'|' -f2 | grep -x 'saved_file_name' | wc -l)
+if [ "$hascol" -eq 1 ]; then
+    echo 'Column already exists; skipping.'
+else
+    sqlite3 "$DB" 'ALTER TABLE requests ADD COLUMN saved_file_name TEXT;' && echo 'Column added'
+    echo 'Running one-time cleanup of stale /tmp/fiteditor files...'
+    mkdir -p /tmp/fiteditor
+    find /tmp/fiteditor -maxdepth 1 -type f -mtime +7 -delete || true
+    find /tmp/fiteditor -maxdepth 1 -mindepth 1 -type d -mtime +7 -exec rm -rf {} \; || true
+fi
+'@
+Set-Content -Path $tmpScript -Value $dbMigrationScript -Encoding UTF8
+
+scp -i $sshKey $tmpScript "${remoteUser}@${remoteHost}:/tmp/migrate.sh"
+ssh -i $sshKey "$remoteUser@$remoteHost" "sed -i 's/\r//' /tmp/migrate.sh && bash /tmp/migrate.sh '$remotePath' && rm /tmp/migrate.sh"
+
+Remove-Item $tmpScript -ErrorAction SilentlyContinue
 if ($LASTEXITCODE -ne 0) { Write-Error "DB migration failed"; exit 1 }
 
 # --- RESTART SERVICE ---
-Write-Host "6/6: Restarting service..."
+Write-Host "5/5: Restarting service..."
 ssh -i $sshKey "$remoteUser@$remoteHost" "sudo systemctl restart $serviceName && sudo systemctl reload nginx"
 if ($LASTEXITCODE -ne 0) { Write-Error "Service restart failed"; exit 1 }
 
 # --- SANITY CHECK ---
-Write-Host "7/6: Sanity check..."
+Write-Host "Sanity check..."
 Start-Sleep -Seconds 2
 $appStatus   = ssh -i $sshKey "$remoteUser@$remoteHost" "sudo systemctl is-active $serviceName"
 $nginxStatus = ssh -i $sshKey "$remoteUser@$remoteHost" "sudo systemctl is-active nginx"
