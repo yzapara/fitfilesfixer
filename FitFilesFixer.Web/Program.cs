@@ -787,7 +787,10 @@ app.Run();
 static class SharedCss
 {
     public static string Footer(string lang) => lang == "uk"
-        ? @"<div class='donate-footer'>
+        ? @"<div class='contact-footer'>
+  <p>Контакти: напишіть на <a href='mailto:veiling.sappy0b@icloud.com'>veiling.sappy0b@icloud.com</a>, якщо є питання або пропозиції.</p>
+</div>
+<div class='donate-footer'>
   <a class='donate-banner' href='https://defensivewave.org/' target='_blank' rel='noopener'>
     <div class='donate-banner-left'>
       <div class='donate-flag'>🇺🇦</div>
@@ -799,7 +802,10 @@ static class SharedCss
     <div class='donate-btn'>Задонатити →</div>
   </a>
 </div>"
-        : @"<div class='donate-footer'>
+        : @"<div class='contact-footer'>
+  <p>Contact author by email <a href='mailto:veiling.sappy0b@icloud.com'>veiling.sappy0b@icloud.com</a> for questions or suggestions.</p>
+</div>
+<div class='donate-footer'>
   <a class='donate-banner' href='https://defensivewave.org/' target='_blank' rel='noopener'>
     <div class='donate-banner-left'>
       <div class='donate-flag'>🇺🇦</div>
@@ -873,6 +879,9 @@ static class SharedCss
   .donate-text strong { display: block; font-size: 15px; font-weight: 500; }
   .donate-text span { font-size: 13px; opacity: 0.85; }
   .donate-btn { background: #ffd700; color: #0057b8; font-size: 13px; font-weight: 500; border-radius: 6px; padding: 8px 18px; white-space: nowrap; flex-shrink: 0; }
+  .contact-footer { margin-top: 24px; margin-bottom: 16px; padding: 10px 14px; border: 1px solid #e1e1e1; border-radius: 10px; background: #fafafa; font-size: 13px; color: #333; }
+  .contact-footer a { color: #185fa5; text-decoration: none; }
+  .contact-footer a:hover { text-decoration: underline; }
   .city-wrap { position: relative; display: inline-block; width: 280px; }
   .city-wrap input[type=text] { width: 100%; box-sizing: border-box; }
   .city-suggestions { position: absolute; top: 100%; left: 0; right: 0; background: #fff; border: 1px solid #ccc; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,.1); z-index: 100; display: none; max-height: 220px; overflow-y: auto; margin-top: 2px; }
