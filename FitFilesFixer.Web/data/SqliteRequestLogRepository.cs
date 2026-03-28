@@ -19,6 +19,7 @@ public class SqliteRequestLogRepository : IRequestLogRepository
                 country TEXT,
                 city TEXT,
                 file_name TEXT,
+                saved_file_name TEXT,
                 file_size_kb INTEGER,
                 total_points INTEGER,
                 fixed_points INTEGER,
@@ -30,6 +31,26 @@ public class SqliteRequestLogRepository : IRequestLogRepository
                 error_message TEXT
             );";
         cmd.ExecuteNonQuery();
+
+        // Add column if older schema exists that lacks saved_file_name
+        cmd.CommandText = "PRAGMA table_info(requests);";
+        using var rdr = cmd.ExecuteReader();
+        var hasSavedFileName = false;
+        while (rdr.Read())
+        {
+            if (rdr.GetString(1) == "saved_file_name")
+            {
+                hasSavedFileName = true;
+                break;
+            }
+        }
+
+        if (!hasSavedFileName)
+        {
+            cmd = conn.CreateCommand();
+            cmd.CommandText = "ALTER TABLE requests ADD COLUMN saved_file_name TEXT;";
+            cmd.ExecuteNonQuery();
+        }
     }
 
     public void Add(string connectionString, RequestLog log)
@@ -40,12 +61,12 @@ public class SqliteRequestLogRepository : IRequestLogRepository
         var cmd = conn.CreateCommand();
         cmd.CommandText = @"
             INSERT INTO requests
-                (timestamp, ip, country, city, file_name, file_size_kb,
+                (timestamp, ip, country, city, file_name, saved_file_name, file_size_kb,
                  total_points, fixed_points,
                  dropped_timestamp, dropped_duplicate, dropped_corrupt,
                  processing_ms, success, error_message)
             VALUES
-                (@ts, @ip, @country, @city, @fn, @fsk,
+                (@ts, @ip, @country, @city, @fn, @sfn, @fsk,
                  @tp, @fp,
                  @dt, @dd, @dc,
                  @ms, @ok, @err)";
@@ -54,6 +75,7 @@ public class SqliteRequestLogRepository : IRequestLogRepository
         cmd.Parameters.AddWithValue("@country", (object?)log.Country ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@city", (object?)log.City ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@fn", (object?)log.FileName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@sfn", (object?)log.SavedFileName ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@fsk", log.FileSizeKb);
         cmd.Parameters.AddWithValue("@tp", log.TotalPoints);
         cmd.Parameters.AddWithValue("@fp", log.FixedPoints);
@@ -107,7 +129,7 @@ public class SqliteRequestLogRepository : IRequestLogRepository
         conn.Open();
         return conn.QueryRows($@"
             SELECT strftime('%d.%m.%Y %H:%M', timestamp) AS timestamp,
-                    ip, country, city, file_name, file_size_kb,
+                    ip, country, city, file_name, saved_file_name, file_size_kb,
                     total_points, fixed_points, processing_ms, success, error_message
             FROM requests
             ORDER BY id DESC

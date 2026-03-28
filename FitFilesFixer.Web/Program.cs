@@ -336,12 +336,39 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
     var originalName  = Path.GetFileNameWithoutExtension(file.FileName);
     var extension     = Path.GetExtension(file.FileName);
 
+    var tmpDir = Path.Combine(Path.GetTempPath(), "fiteditor");
+    Directory.CreateDirectory(tmpDir);
+    var uploadId = Guid.NewGuid().ToString("N");
+    var savedUploadName = $"upload_{uploadId}{extension}";
+    var savedUploadPath = Path.Combine(tmpDir, savedUploadName);
+
+    await using (var sourceStream = file.OpenReadStream())
+    await using (var targetStream = File.Create(savedUploadPath))
+    {
+        await sourceStream.CopyToAsync(targetStream);
+    }
+
     FitProcessResult result;
 
     try
     {
-        await using var stream = file.OpenReadStream();
-        result = await fitFixerService.ProcessAsync(stream, file.FileName, maxSpeedKmh, startLat, startLon);
+        await using var processStream = File.OpenRead(savedUploadPath);
+        result = await fitFixerService.ProcessAsync(processStream, file.FileName, maxSpeedKmh, startLat, startLon);
+
+        await requestLogService.LogAsync(GetConnectionString(), new RequestLog
+        {
+            Ip = clientIp,
+            FileName = file.FileName,
+            SavedFileName = savedUploadName,
+            FileSizeKb = (int)(file.Length / 1024),
+            TotalPoints = result.TotalPoints,
+            FixedPoints = result.FixedPoints,
+            DroppedTimestamp = result.DroppedTimestamp,
+            DroppedDuplicate = result.DroppedDuplicate,
+            DroppedCorrupt = result.DroppedCorrupt,
+            Success = true,
+            ProcessingMs = (int)sw.ElapsedMilliseconds
+        });
     }
     catch (Exception ex)
     {
@@ -349,13 +376,51 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
         {
             Ip = clientIp,
             FileName = file.FileName,
+            SavedFileName = savedUploadName,
             FileSizeKb = (int)(file.Length / 1024),
             Success = false,
             ErrorMessage = ex.Message,
             ProcessingMs = (int)sw.ElapsedMilliseconds
         });
 
-        return Results.Problem("Processing failed: " + ex.Message);
+        var errorHtml = $@"
+<html>
+<head>
+<meta charset='utf-8'>
+<title>FIT Fixer — Error</title>
+<style>{SharedCss.Css}</style>
+</head>
+<body>
+
+<div class='page-header'>
+  <div class='page-header-left'>
+    <div class='icon-wrap'>
+      <svg width='16' height='16' viewBox='0 0 16 16' fill='none'>
+        <path d='M8 2v8M5 7l3 3 3-3M3 13h10' stroke='#111' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/>
+      </svg>
+    </div>
+    <div><h1>FIT Fixer</h1></div>
+  </div>
+  {Lang.LangToggleHtml(lang)}
+</div>
+
+<h2 style='color:red'>{T("result.error_heading")}</h2>
+<p>{T("result.error_body")}</p>
+<ul>
+  <li>{T("stats.col_file")}: {file.FileName}</li>
+  <li>{T("stats.col_size")}: {(file.Length / 1024)} KB</li>
+  <li>{T("result.error_message")}: {WebUtility.HtmlEncode(ex.Message)}</li>
+</ul>
+<p>
+  <a class='btn-primary' href='/download-original?file={Uri.EscapeDataString(savedUploadName)}&name={Uri.EscapeDataString(file.FileName)}'>{T("result.download_original")}</a>
+  <a class='btn-secondary' href='/?lang={lang}'>{T("result.upload_another")}</a>
+  <a class='btn-secondary' href='/stats?lang={lang}'>{T("upload.stats_link")}</a>
+</p>
+{SharedCss.Footer(lang)}
+</body>
+</html>";
+
+        return Results.Content(errorHtml, "text/html; charset=utf-8", statusCode: 500);
     }
 
     sw.Stop();
@@ -516,6 +581,25 @@ app.MapGet("/download", (HttpRequest request) =>
     return Results.File(stream, "application/octet-stream", userFileName, enableRangeProcessing: false);
 });
 
+app.MapGet("/download-original", (HttpRequest request) =>
+{
+    var savedFileName = request.Query["file"].ToString();
+    var userFileName = request.Query["name"].ToString();
+
+    if (string.IsNullOrEmpty(savedFileName) || string.IsNullOrEmpty(userFileName))
+        return Results.BadRequest("Missing file or name parameter.");
+
+    if (savedFileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+        return Results.BadRequest("Invalid file name.");
+
+    var filePath = Path.Combine(Path.GetTempPath(), "fiteditor", savedFileName);
+    if (!File.Exists(filePath))
+        return Results.NotFound("File not found.");
+
+    var stream = File.OpenRead(filePath);
+    return Results.File(stream, "application/octet-stream", userFileName, enableRangeProcessing: false);
+});
+
 // ---------------------------------------------------------------------------
 // GET /stats  — request history dashboard
 // ---------------------------------------------------------------------------
@@ -539,20 +623,28 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
     var countryRows = string.Concat(byCountry.Select(r =>
         $"<tr><td>{N(r["country"])}</td><td>{N(r["cnt"])}</td></tr>"));
 
-    var historyRows = string.Concat(rows.Select(r => $@"
+    var historyRows = string.Concat(rows.Select(r => {
+        var saved = N(r["saved_file_name"]);
+        var fileName = N(r["file_name"]);
+        var downloadLink = string.IsNullOrEmpty(saved) || saved == "-"
+            ? fileName
+            : $"<a href='/download-original?file={Uri.EscapeDataString(saved)}&name={Uri.EscapeDataString(fileName)}'>{T("stats.col_download")}</a>";
+
+        return $@"
         <tr>
             <td>{N(r["timestamp"])}</td>
             <td>{N(r["ip"])}</td>
             <td>{N(r["country"])}</td>
             <td>{N(r["city"])}</td>
-            <td>{N(r["file_name"])}</td>
+            <td>{downloadLink}</td>
             <td>{N(r["file_size_kb"])} KB</td>
             <td>{N(r["total_points"])}</td>
             <td>{N(r["fixed_points"])}</td>
             <td>{N(r["processing_ms"])} ms</td>
             <td>{Badge(r["success"])}</td>
             <td style='color:red;font-size:0.85em'>{N(r["error_message"])}</td>
-        </tr>"));
+        </tr>";
+    }));
 
     var html = $@"
 <html>
@@ -603,7 +695,7 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
   <tr>
     <th>{T("stats.col_time")}</th><th>{T("stats.col_ip")}</th>
     <th>{T("stats.col_country")}</th><th>{T("stats.col_city")}</th>
-    <th>{T("stats.col_file")}</th><th>{T("stats.col_size")}</th>
+    <th>{T("stats.col_file")}</th><th>{T("stats.col_size")}</th><th>{T("stats.col_download")}</th>
     <th>{T("stats.col_points")}</th><th>{T("stats.col_fixed")}</th>
     <th>{T("stats.col_time2")}</th><th>{T("stats.col_ok")}</th>
     <th>{T("stats.col_error")}</th>
