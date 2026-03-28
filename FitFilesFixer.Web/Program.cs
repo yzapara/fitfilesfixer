@@ -1,9 +1,14 @@
 ﻿using Microsoft.AspNetCore.HttpOverrides;
 using System.Diagnostics;
+using System.Globalization;
 using System.Net;
 using System.Text.Json;
 using Dynastream.Fit;
 using Microsoft.Data.Sqlite;
+using FitFilesFixer.Web.Data;
+using FitFilesFixer.Web.Infrastructure;
+using FitFilesFixer.Web.Models;
+using FitFilesFixer.Web.Services;
 using File = System.IO.File;
 
 // ---------------------------------------------------------------------------
@@ -12,6 +17,13 @@ using File = System.IO.File;
 SQLitePCL.Batteries.Init();
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddSingleton<IRequestLogRepository, SqliteRequestLogRepository>();
+builder.Services.AddSingleton<IRequestLogService, RequestLogService>();
+builder.Services.AddSingleton<IGeolocationService, GeolocationService>();
+builder.Services.AddSingleton<ICityLookupService, CityLookupService>();
+builder.Services.AddSingleton<IFitFixerService, FitFixerService>();
+builder.Services.AddSingleton<ILanguageService, LanguageService>();
 
 builder.Services.Configure<ForwardedHeadersOptions>(options => {
     options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
@@ -39,6 +51,9 @@ const string validApiKey = "RUSNI_PYZDA";
 var app = builder.Build();
 app.UseForwardedHeaders();
 
+var requestLogRepo = app.Services.GetRequiredService<IRequestLogRepository>();
+requestLogRepo.EnsureSchema(GetConnectionString());
+
 string GetConnectionString()
 {
     var configured = app.Configuration.GetConnectionString("Sqlite");
@@ -53,96 +68,20 @@ string GetConnectionString()
 // ---------------------------------------------------------------------------
 // GET /api/geolocate  — returns best-guess city for the caller's IP
 // ---------------------------------------------------------------------------
-app.MapGet("/api/geolocate", async (HttpRequest request, IHttpClientFactory httpClientFactory) =>
+app.MapGet("/api/geolocate", async (HttpRequest request, IGeolocationService geoService) =>
 {
     var ip = request.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "";
-    if (string.IsNullOrEmpty(ip) || ip == "unknown" || Helpers.IsPrivateIp(ip))
-        return Results.Json(new { city = "Kharkiv", lat = 49.9935, lon = 36.2304 });
-
-    try
-    {
-        var geo  = httpClientFactory.CreateClient("geo");
-        var resp = await geo.GetAsync($"/json/{ip}?fields=status,city,lat,lon");
-        if (resp.IsSuccessStatusCode)
-        {
-            var json = await resp.Content.ReadAsStringAsync();
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            if (root.TryGetProperty("status", out var st) && st.GetString() == "success")
-            {
-                var city = root.TryGetProperty("city", out var c) ? c.GetString() : null;
-                var lat  = root.TryGetProperty("lat",  out var la) ? la.GetDouble() : 49.9935;
-                var lon  = root.TryGetProperty("lon",  out var lo) ? lo.GetDouble() : 36.2304;
-                if (!string.IsNullOrEmpty(city))
-                    return Results.Json(new { city, lat, lon });
-            }
-        }
-    }
-    catch { }
-
-    return Results.Json(new { city = "Kharkiv", lat = 49.9935, lon = 36.2304 });
+    var geo = await geoService.GeolocateAsync(ip);
+    return Results.Json(new { city = geo.City, lat = geo.Lat, lon = geo.Lon });
 });
 
 // ---------------------------------------------------------------------------
 // GET /api/cities?q=...  — city autocomplete via Nominatim (OpenStreetMap)
 // ---------------------------------------------------------------------------
-app.MapGet("/api/cities", async (string? q, IHttpClientFactory httpClientFactory) =>
+app.MapGet("/api/cities", async (string? q, ICityLookupService cityLookup) =>
 {
-    if (string.IsNullOrWhiteSpace(q) || q.Length < 2)
-        return Results.Json(Array.Empty<object>());
-
-    try
-    {
-        var client = httpClientFactory.CreateClient("nominatim");
-        // featureType=city  — restricts results to populated places
-        // addressdetails=0  — we don't need the full address breakdown
-        var url = $"/search?q={Uri.EscapeDataString(q)}&format=jsonv2&limit=8&featureType=city&addressdetails=1&accept-language=en";
-        var resp = await client.GetAsync(url);
-        if (!resp.IsSuccessStatusCode)
-            return Results.Json(Array.Empty<object>());
-
-        var json = await resp.Content.ReadAsStringAsync();
-        using var doc = JsonDocument.Parse(json);
-
-        var results = doc.RootElement.EnumerateArray()
-            .Select(el =>
-            {
-                // Build a readable "City, Country" display name from address details
-                // when available; fall back to Nominatim's own display_name.
-                var addr       = el.TryGetProperty("address",      out var a)  ? a  : (JsonElement?)null;
-                var city       = GetAddrPart(addr, "city", "town", "village", "municipality");
-                var country    = GetAddrPart(addr, "country");
-                var displayName = (!string.IsNullOrEmpty(city) && !string.IsNullOrEmpty(country))
-                    ? $"{city}, {country}"
-                    : el.TryGetProperty("display_name", out var dn) ? dn.GetString() ?? "" : "";
-
-                var lat = el.TryGetProperty("lat", out var la) && double.TryParse(la.GetString(),
-                              System.Globalization.NumberStyles.Float,
-                              System.Globalization.CultureInfo.InvariantCulture, out var latV) ? latV : 0.0;
-                var lon = el.TryGetProperty("lon", out var lo) && double.TryParse(lo.GetString(),
-                              System.Globalization.NumberStyles.Float,
-                              System.Globalization.CultureInfo.InvariantCulture, out var lonV) ? lonV : 0.0;
-
-                return new { name = displayName, lat, lon };
-            })
-            .Where(x => !string.IsNullOrEmpty(x.name) && (x.lat != 0.0 || x.lon != 0.0))
-            .ToArray();
-
-        return Results.Json(results);
-    }
-    catch
-    {
-        return Results.Json(Array.Empty<object>());
-    }
-
-    static string? GetAddrPart(JsonElement? addr, params string[] keys)
-    {
-        if (addr is null) return null;
-        foreach (var key in keys)
-            if (addr.Value.TryGetProperty(key, out var v))
-                return v.GetString();
-        return null;
-    }
+    var results = await cityLookup.SearchCitiesAsync(q ?? string.Empty);
+    return Results.Json(results.Select(r => new { name = r.Name, lat = r.Latitude, lon = r.Longitude }));
 });
 
 
@@ -318,7 +257,7 @@ app.MapGet("/", (HttpRequest request, HttpResponse response) =>
 // ---------------------------------------------------------------------------
 // POST /process  — main processing endpoint
 // ---------------------------------------------------------------------------
-app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttpClientFactory httpClientFactory) =>
+app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitFixerService fitFixerService, IRequestLogService requestLogService, ILanguageService langService) =>
 {
     var sw = Stopwatch.StartNew();
 
@@ -327,10 +266,10 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
 
     var form = await request.ReadFormAsync();
     var lang = form["lang"].ToString();
-    if (lang != "uk" && lang != "en") lang = Lang.Detect(request);
-    Lang.SetCookie(response, lang);
+    if (lang != "uk" && lang != "en") lang = langService.Detect(request);
+    langService.SetCookie(response, lang);
 
-    string T(string k) => Lang.T(k, lang);
+    string T(string k) => langService.T(k, lang);
 
     var clientIp = request.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
 
@@ -343,15 +282,9 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
     double maxSpeedMs = maxSpeedKmh / 3.6;
 
     // ---- START AREA PARAMETER ----
-    // Center point used to validate the very first GPS point in the file.
-    // If the first candidate is further than START_AREA_RADIUS_KM from this
-    // center, it is treated as a pre-start glitch and discarded.
-    const double START_AREA_RADIUS_M = 50_000.0; // 50 km
     double? startLat = null, startLon = null;
-    if (double.TryParse(form["startLat"].ToString(), System.Globalization.NumberStyles.Float,
-                        System.Globalization.CultureInfo.InvariantCulture, out var sLat) &&
-        double.TryParse(form["startLon"].ToString(), System.Globalization.NumberStyles.Float,
-                        System.Globalization.CultureInfo.InvariantCulture, out var sLon) &&
+    if (double.TryParse(form["startLat"].ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var sLat) &&
+        double.TryParse(form["startLon"].ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var sLon) &&
         sLat >= -90 && sLat <= 90 && sLon >= -180 && sLon <= 180)
     {
         startLat = sLat;
@@ -362,13 +295,13 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
     var apiKey = form["apiKey"].ToString();
     if (string.IsNullOrEmpty(apiKey) || apiKey != validApiKey)
     {
-        await Helpers.LogRequestAsync(GetConnectionString(), new RequestLog
+        await requestLogService.LogAsync(GetConnectionString(), new RequestLog
         {
             Ip = clientIp,
             Success = false,
             ErrorMessage = "Invalid API key",
             ProcessingMs = (int)sw.ElapsedMilliseconds
-        }, httpClientFactory);
+        });
 
         var deniedHtml = $@"
 <html><head><meta charset='utf-8'><title>{T("denied.title")}</title>
@@ -402,181 +335,17 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
 
     var originalName  = Path.GetFileNameWithoutExtension(file.FileName);
     var extension     = Path.GetExtension(file.FileName);
-    var uniqueId      = Guid.NewGuid().ToString();
-    var outputName    = $"{originalName}_fixed{extension}";
-    var savedFileName = $"{outputName}.{uniqueId}";
 
-    var tmpDir     = Path.Combine(Path.GetTempPath(), "fiteditor");
-    Directory.CreateDirectory(tmpDir);
-    var inputPath  = Path.Combine(tmpDir, "activity.fit");
-    var outputPath = Path.Combine(tmpDir, savedFileName);
-
-    await using (var fs = File.Create(inputPath))
-        await file.CopyToAsync(fs);
-
-    int nullCoords = 0, jumpCoords = 0, fixedPoints = 0, totalPoints = 0;
-    int droppedTimestamp = 0, droppedDuplicate = 0, droppedCorrupt = 0;
-    var trackPoints = new List<TrackPoint>();
+    FitProcessResult result;
 
     try
     {
-        var messages = FitHelpers.ReadAllMessages(inputPath);
-
-        const uint MIN_VALID_FIT_TS = 315619200u;
-        const uint MAX_VALID_FIT_TS = 1420156800u;
-
-        // lastValid*: anchor of the most recently accepted genuine point.
-        // Updated only when a point passes the speed check (or is the very
-        // first point). Fixed/clamped points never update it, which prevents
-        // the cascade-collapse bug where every post-glitch point gets fixed
-        // because the anchor stayed frozen at the pre-glitch position.
-        double? lastValidLatDeg = null;
-        double? lastValidLonDeg = null;
-        uint?   lastValidTs     = null;
-
-        bool fileIdSeen = false;
-        var cleanMessages = new List<Mesg>();
-
-        foreach (var m in messages)
-        {
-            // ---- Drop duplicate file_id ----
-            if (m.Num == MesgNum.FileId)
-            {
-                if (fileIdSeen) { droppedDuplicate++; continue; }
-                fileIdSeen = true;
-                cleanMessages.Add(m);
-                continue;
-            }
-
-            // ---- Drop entirely corrupt messages ----
-            if (m.Num == MesgNum.Invalid)
-            {
-                droppedCorrupt++;
-                continue;
-            }
-
-            // ---- Non-record messages: only check timestamp validity ----
-            if (!string.Equals(m.Name, "record", StringComparison.OrdinalIgnoreCase))
-            {
-                var tsField = m.GetField(253);
-                if (tsField?.GetValue() is uint uval &&
-                    (uval < MIN_VALID_FIT_TS || uval > MAX_VALID_FIT_TS))
-                {
-                    droppedTimestamp++;
-                    continue;
-                }
-                cleanMessages.Add(m);
-                continue;
-            }
-
-            // ---- Record message ----
-            totalPoints++;
-            var rec     = new RecordMesg(m);
-            int? recLat = rec.GetPositionLat();
-            int? recLon = rec.GetPositionLong();
-
-            // Extract a valid FIT timestamp for this record, if present.
-            uint? recTs = rec.GetField(253)?.GetValue() is uint rts &&
-                          rts >= MIN_VALID_FIT_TS && rts <= MAX_VALID_FIT_TS
-                          ? rts : (uint?)null;
-
-            bool needsFix = false;
-
-            if (recLat == null || recLon == null)
-            {
-                // Missing coordinates — always fix.
-                nullCoords++;
-                needsFix = true;
-            }
-            else
-            {
-                double latDeg = FitHelpers.SemicirclesToDegrees(recLat.Value);
-                double lonDeg = FitHelpers.SemicirclesToDegrees(recLon.Value);
-
-                if (!lastValidLatDeg.HasValue)
-                {
-                    // No anchor yet.
-                    // If a start area was provided, only accept this point
-                    // when it is within START_AREA_RADIUS_M of the center —
-                    // anything further is a pre-start GPS glitch.
-                    // Without a start area, accept the first point unconditionally.
-                    bool withinStartArea = !startLat.HasValue ||
-                        FitHelpers.HaversineMeters(startLat.Value, startLon!.Value,
-                                                   latDeg, lonDeg) <= START_AREA_RADIUS_M;
-
-                    if (withinStartArea)
-                    {
-                        lastValidLatDeg = latDeg;
-                        lastValidLonDeg = lonDeg;
-                        lastValidTs     = recTs;
-                    }
-                    else
-                    {
-                        jumpCoords++;
-                        needsFix = true;
-                    }
-                }
-                else
-                {
-                    double dist = FitHelpers.HaversineMeters(
-                        lastValidLatDeg.Value, lastValidLonDeg!.Value,
-                        latDeg, lonDeg);
-
-                    // Maximum distance coverable at the configured speed limit
-                    // over the elapsed time between this point and the anchor.
-                    // Use real elapsed seconds when timestamps are available
-                    // and monotonically increasing; fall back to 1 s otherwise
-                    // (conservative: ~19 m at 70 km/h — catches any 180°-flip
-                    // glitch while still allowing normal inter-point movement).
-                    double dtSeconds = 1.0;
-                    if (recTs.HasValue && lastValidTs.HasValue && recTs.Value > lastValidTs.Value)
-                        dtSeconds = recTs.Value - lastValidTs.Value;
-
-                    double maxAllowedDist = maxSpeedMs * dtSeconds;
-
-                    if (dist > maxAllowedDist)
-                    {
-                        jumpCoords++;
-                        needsFix = true;
-                    }
-                    // else: reachable at the configured speed — valid.
-                }
-            }
-
-            if (needsFix)
-            {
-                // Clamp priority:
-                //   1. Last known-good anchor (normal case)
-                //   2. Start area center (no anchor yet, but user provided one)
-                //   3. Leave unset — encoder emits a gap (last resort)
-                double? clampLat = lastValidLatDeg ?? startLat;
-                double? clampLon = lastValidLonDeg ?? startLon;
-
-                if (clampLat.HasValue)
-                {
-                    rec.SetPositionLat(FitHelpers.DegreesToSemicircles(clampLat.Value));
-                    rec.SetPositionLong(FitHelpers.DegreesToSemicircles(clampLon!.Value));
-                    trackPoints.Add(new TrackPoint(clampLat.Value, clampLon.Value, Fixed: true));
-                }
-                fixedPoints++;
-            }
-            else if (recLat != null && recLon != null)
-            {
-                // Valid point — update the anchor.
-                lastValidLatDeg = FitHelpers.SemicirclesToDegrees(recLat.Value);
-                lastValidLonDeg = FitHelpers.SemicirclesToDegrees(recLon.Value);
-                lastValidTs     = recTs;
-                trackPoints.Add(new TrackPoint(lastValidLatDeg.Value, lastValidLonDeg.Value, Fixed: false));
-            }
-
-            cleanMessages.Add(rec);
-        }
-
-        FitHelpers.WriteAllMessages(cleanMessages, outputPath);
+        await using var stream = file.OpenReadStream();
+        result = await fitFixerService.ProcessAsync(stream, file.FileName, maxSpeedKmh, startLat, startLon);
     }
     catch (Exception ex)
     {
-        await Helpers.LogRequestAsync(GetConnectionString(), new RequestLog
+        await requestLogService.LogAsync(GetConnectionString(), new RequestLog
         {
             Ip = clientIp,
             FileName = file.FileName,
@@ -584,36 +353,28 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
             Success = false,
             ErrorMessage = ex.Message,
             ProcessingMs = (int)sw.ElapsedMilliseconds
-        }, httpClientFactory);
+        });
 
         return Results.Problem("Processing failed: " + ex.Message);
     }
 
     sw.Stop();
 
-    await Helpers.LogRequestAsync(GetConnectionString(), new RequestLog
-    {
-        Ip = clientIp,
-        FileName = file.FileName,
-        FileSizeKb = (int)(file.Length / 1024),
-        TotalPoints = totalPoints,
-        FixedPoints = fixedPoints,
-        DroppedTimestamp = droppedTimestamp,
-        DroppedDuplicate = droppedDuplicate,
-        DroppedCorrupt = droppedCorrupt,
-        ProcessingMs = (int)sw.ElapsedMilliseconds,
-        Success = true
-    }, httpClientFactory);
+    var outputName = result.OutputName;
+    var savedFileName = Path.GetFileName(result.OutputPath);
+
+    var totalPoints = result.TotalPoints;
+    var nullCoords = result.NullCoords;
+    var jumpCoords = result.JumpCoords;
+    var fixedPoints = result.FixedPoints;
+    var droppedTimestamp = result.DroppedTimestamp;
+    var droppedDuplicate = result.DroppedDuplicate;
+    var droppedCorrupt = result.DroppedCorrupt;
+
+    var mapPoints = result.TrackPoints;
+    var trackJson = "[" + string.Join(",", mapPoints.Select(p => $"[{p.Lat:F6},{p.Lon:F6},{(p.Fixed ? 1 : 0)}]")) + "]";
 
     var downloadUrl = $"/download?file={Uri.EscapeDataString(savedFileName)}&name={Uri.EscapeDataString(outputName)}&lang={lang}";
-
-    // ---- Build compact track JSON for the map ----
-    // Subsample to at most 4000 points so the inline JSON stays manageable,
-    // but always keep every fixed point so they are visible on the map.
-    var mapPoints = TrackSampler.Subsample(trackPoints, maxPoints: 4000);
-    // Serialize as a flat array of [lat, lon, fixed] triples for minimum size.
-    var trackJson = "[" + string.Join(",",
-        mapPoints.Select(p => $"[{p.Lat:F6},{p.Lon:F6},{(p.Fixed ? 1 : 0)}]")) + "]";
 
     var mapSection = "";
     if (mapPoints.Count > 0)
@@ -704,18 +465,8 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
       <p class='sub'>{string.Format(T("result.sub"), sw.ElapsedMilliseconds)}</p>
     </div>
   </div>
-  {Lang.LangToggleHtml(lang)}
+  {langService.LangToggleHtml(lang)}
 </div>
-
-<p class='section-label'>{T("result.coord_section")}</p>
-<div class='kpi-grid'>
-  <div class='kpi'><div class='val'>{totalPoints}</div><div class='lbl'>{T("result.total")}</div></div>
-  <div class='kpi'><div class='val'>{nullCoords}</div><div class='lbl'>{T("result.null")}</div></div>
-  <div class='kpi'><div class='val'>{jumpCoords}</div><div class='lbl'>{string.Format(T("result.jump"), (int)maxSpeedKmh)}</div></div>
-  <div class='kpi'><div class='val good'>{fixedPoints}</div><div class='lbl'>{T("result.fixed")}</div></div>
-</div>
-
-<hr/>
 
 <p class='section-label'>{T("result.dropped")}</p>
 <div class='drop-row'>
@@ -768,41 +519,16 @@ app.MapGet("/download", (HttpRequest request) =>
 // ---------------------------------------------------------------------------
 // GET /stats  — request history dashboard
 // ---------------------------------------------------------------------------
-app.MapGet("/stats", (HttpRequest request, HttpResponse response) =>
+app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageService langService, IRequestLogRepository requestLogRepository) =>
 {
-    var lang = Lang.Detect(request);
-    Lang.SetCookie(response, lang);
-    string T(string k) => Lang.T(k, lang);
+    var lang = langService.Detect(request);
+    langService.SetCookie(response, lang);
+    string T(string k) => langService.T(k, lang);
 
-    using var conn = new SqliteConnection(GetConnectionString());
-    conn.Open();
-
-    var summary = conn.QuerySingle(@"
-        SELECT
-            COUNT(*)                                                    AS total,
-            SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END)               AS succeeded,
-            SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END)               AS failed,
-            ROUND(AVG(CASE WHEN success = 1 THEN processing_ms END), 0) AS avg_ms,
-            SUM(total_points)                                           AS sum_points,
-            SUM(fixed_points)                                           AS sum_fixed
-        FROM requests");
-
-    var uniqueIps = conn.QuerySingle(@"SELECT COUNT(DISTINCT ip) AS cnt FROM requests");
-
-    var byCountry = conn.QueryRows(@"
-        SELECT COALESCE(country, 'Unknown') AS country, COUNT(*) AS cnt
-        FROM requests
-        GROUP BY country
-        ORDER BY cnt DESC
-        LIMIT 20");
-
-    var rows = conn.QueryRows(@"
-        SELECT strftime('%d.%m.%Y %H:%M', timestamp) AS timestamp,
-               ip, country, city, file_name, file_size_kb,
-               total_points, fixed_points, processing_ms, success, error_message
-        FROM requests
-        ORDER BY id DESC
-        LIMIT 50");
+    var summary = requestLogRepository.GetSummary(GetConnectionString());
+    var uniqueIps = new Dictionary<string, object?> { ["cnt"] = requestLogRepository.GetUniqueIpCount(GetConnectionString()) };
+    var byCountry = requestLogRepository.GetRequestsByCountry(GetConnectionString());
+    var rows = requestLogRepository.GetLastRequests(GetConnectionString());
 
     static string N(object? v) => v?.ToString() ?? "-";
     static string Badge(object? v) =>
@@ -1130,237 +856,3 @@ function setLang(l){{
             : key;
 }
 
-// ---------------------------------------------------------------------------
-// Track point for map rendering
-// ---------------------------------------------------------------------------
-
-/// <summary>
-/// A single GPS point collected after processing.
-/// <c>Fixed</c> is true when the coordinates were clamped by the fixer.
-/// </summary>
-record TrackPoint(double Lat, double Lon, bool Fixed);
-
-// ---------------------------------------------------------------------------
-// Request log data model
-// ---------------------------------------------------------------------------
-record RequestLog
-{
-    public string? Ip               { get; init; }
-    public string? FileName         { get; init; }
-    public int     FileSizeKb       { get; init; }
-    public int     TotalPoints      { get; init; }
-    public int     FixedPoints      { get; init; }
-    public int     DroppedTimestamp { get; init; }
-    public int     DroppedDuplicate { get; init; }
-    public int     DroppedCorrupt   { get; init; }
-    public int     ProcessingMs     { get; init; }
-    public bool    Success          { get; init; }
-    public string? ErrorMessage     { get; init; }
-}
-
-static class Helpers
-{
-    public static async Task LogRequestAsync(
-        string connectionString,
-        RequestLog log,
-        IHttpClientFactory httpClientFactory)
-    {
-        string? country = null, city = null;
-
-        if (!string.IsNullOrEmpty(log.Ip) && log.Ip != "unknown" && !IsPrivateIp(log.Ip))
-        {
-            try
-            {
-                var geo  = httpClientFactory.CreateClient("geo");
-                var resp = await geo.GetAsync($"/json/{log.Ip}?fields=country,city,status");
-                if (resp.IsSuccessStatusCode)
-                {
-                    var json = await resp.Content.ReadAsStringAsync();
-                    using var doc = JsonDocument.Parse(json);
-                    var root = doc.RootElement;
-                    if (root.TryGetProperty("status", out var status) &&
-                        status.GetString() == "success")
-                    {
-                        country = root.TryGetProperty("country", out var c)  ? c.GetString()  : null;
-                        city    = root.TryGetProperty("city",    out var ci) ? ci.GetString() : null;
-                    }
-                }
-            }
-            catch { }
-        }
-
-        try
-        {
-            using var conn = new SqliteConnection(connectionString);
-            conn.Open();
-            var cmd = conn.CreateCommand();
-            cmd.CommandText = @"
-                INSERT INTO requests
-                    (timestamp, ip, country, city, file_name, file_size_kb,
-                     total_points, fixed_points,
-                     dropped_timestamp, dropped_duplicate, dropped_corrupt,
-                     processing_ms, success, error_message)
-                VALUES
-                    (@ts, @ip, @country, @city, @fn, @fsk,
-                     @tp, @fp,
-                     @dt, @dd, @dc,
-                     @ms, @ok, @err)";
-            cmd.Parameters.AddWithValue("@ts",      System.DateTime.UtcNow.ToString("o"));
-            cmd.Parameters.AddWithValue("@ip",      (object?)log.Ip          ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@country", (object?)country          ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@city",    (object?)city              ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@fn",      (object?)log.FileName     ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@fsk",     log.FileSizeKb);
-            cmd.Parameters.AddWithValue("@tp",      log.TotalPoints);
-            cmd.Parameters.AddWithValue("@fp",      log.FixedPoints);
-            cmd.Parameters.AddWithValue("@dt",      log.DroppedTimestamp);
-            cmd.Parameters.AddWithValue("@dd",      log.DroppedDuplicate);
-            cmd.Parameters.AddWithValue("@dc",      log.DroppedCorrupt);
-            cmd.Parameters.AddWithValue("@ms",      log.ProcessingMs);
-            cmd.Parameters.AddWithValue("@ok",      log.Success ? 1 : 0);
-            cmd.Parameters.AddWithValue("@err",     (object?)log.ErrorMessage ?? DBNull.Value);
-            cmd.ExecuteNonQuery();
-        }
-        catch { }
-    }
-
-    public static bool IsPrivateIp(string ip)
-    {
-        if (!IPAddress.TryParse(ip, out var addr)) return true;
-        var b = addr.GetAddressBytes();
-        return addr.ToString() == "::1"
-            || addr.IsIPv6LinkLocal
-            || (b.Length == 4 && (
-                   b[0] == 10
-                || b[0] == 127
-                || (b[0] == 172 && b[1] >= 16 && b[1] <= 31)
-                || (b[0] == 192 && b[1] == 168)));
-    }
-}
-
-static class FitHelpers
-{
-    /// <summary>
-    /// Returns the great-circle distance in metres between two WGS-84 points
-    /// using the Haversine formula.
-    /// </summary>
-    public static double HaversineMeters(double lat1, double lon1, double lat2, double lon2)
-    {
-        const double R = 6_371_000.0; // Earth radius in metres
-        double dLat = ToRad(lat2 - lat1);
-        double dLon = ToRad(lon2 - lon1);
-        double a = Math.Sin(dLat / 2) * Math.Sin(dLat / 2)
-                 + Math.Cos(ToRad(lat1)) * Math.Cos(ToRad(lat2))
-                 * Math.Sin(dLon / 2) * Math.Sin(dLon / 2);
-        return R * 2 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
-    }
-
-    private static double ToRad(double deg) => deg * Math.PI / 180.0;
-
-    public static int DegreesToSemicircles(double degrees)
-        => (int)(degrees * (Math.Pow(2, 31) / 180.0));
-
-    public static double SemicirclesToDegrees(int semicircles)
-        => semicircles * (180.0 / Math.Pow(2, 31));
-
-    public static List<Mesg> ReadAllMessages(string filePath)
-    {
-        var all         = new List<Mesg>();
-        using var fs    = new FileStream(filePath, FileMode.Open, FileAccess.Read);
-        var decode      = new Decode();
-        var broadcaster = new MesgBroadcaster();
-        broadcaster.MesgEvent      += (_, e) => all.Add(e.mesg);
-        decode.MesgEvent           += broadcaster.OnMesg;
-        decode.MesgDefinitionEvent += broadcaster.OnMesgDefinition;
-        decode.Read(fs);
-        return all;
-    }
-
-    public static void WriteAllMessages(List<Mesg> messages, string filePath)
-    {
-        using var fs = new FileStream(filePath, FileMode.Create, FileAccess.ReadWrite);
-        var encoder  = new Encode(ProtocolVersion.V20);
-        encoder.Open(fs);
-        foreach (var m in messages)
-            encoder.Write(m);
-        encoder.Close();
-    }
-}
-
-static class SqliteExtensions
-{
-    public static Dictionary<string, object?> QuerySingle(
-        this SqliteConnection conn, string sql)
-    {
-        using var cmd    = conn.CreateCommand();
-        cmd.CommandText  = sql;
-        using var reader = cmd.ExecuteReader();
-        if (!reader.Read()) return new();
-        var row = new Dictionary<string, object?>();
-        for (int i = 0; i < reader.FieldCount; i++)
-            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
-        return row;
-    }
-
-    public static List<Dictionary<string, object?>> QueryRows(
-        this SqliteConnection conn, string sql)
-    {
-        using var cmd    = conn.CreateCommand();
-        cmd.CommandText  = sql;
-        using var reader = cmd.ExecuteReader();
-        var rows = new List<Dictionary<string, object?>>();
-        while (reader.Read())
-        {
-            var row = new Dictionary<string, object?>();
-            for (int i = 0; i < reader.FieldCount; i++)
-                row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
-            rows.Add(row);
-        }
-        return rows;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Track subsampler
-// ---------------------------------------------------------------------------
-static class TrackSampler
-{
-    /// <summary>
-    /// Returns a subsampled copy of <paramref name="points"/> with at most
-    /// <paramref name="maxPoints"/> entries, preserving the spatial shape of
-    /// both valid and fixed segments.
-    ///
-    /// Strategy: uniform stride over the whole list. At each selected slot,
-    /// prefer a fixed point over a valid one (scan forward up to <c>step</c>
-    /// positions) so that repaired segments stay visible. When fixed points
-    /// alone exceed maxPoints, they are also strided uniformly — the map will
-    /// still show a coloured blob at the right location.
-    /// </summary>
-    public static List<TrackPoint> Subsample(List<TrackPoint> points, int maxPoints)
-    {
-        if (points.Count <= maxPoints)
-            return points;
-
-        // Uniform stride across the entire list.
-        double step = (double)points.Count / maxPoints;
-        var result = new List<TrackPoint>(maxPoints);
-
-        for (int slot = 0; slot < maxPoints; slot++)
-        {
-            // Centre of this slot's window in the source list.
-            int centre = (int)(slot * step + step / 2.0);
-            int lo     = (int)(slot * step);
-            int hi     = Math.Min(points.Count - 1, (int)((slot + 1) * step) - 1);
-
-            // Prefer the first fixed point in [lo..hi]; fall back to centre.
-            TrackPoint? chosen = null;
-            for (int j = lo; j <= hi; j++)
-            {
-                if (points[j].Fixed) { chosen = points[j]; break; }
-            }
-            result.Add(chosen ?? points[Math.Clamp(centre, 0, points.Count - 1)]);
-        }
-
-        return result;
-    }
-}
