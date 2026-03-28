@@ -26,6 +26,15 @@ builder.Services.AddHttpClient("geo", c =>
     c.Timeout = TimeSpan.FromSeconds(3);
 });
 
+builder.Services.AddHttpClient("nominatim", c =>
+{
+    c.BaseAddress = new Uri("https://nominatim.openstreetmap.org");
+    c.Timeout = TimeSpan.FromSeconds(5);
+    // Nominatim usage policy requires a meaningful User-Agent identifying the app.
+    c.DefaultRequestHeaders.UserAgent.ParseAdd("FitFilesFixer/1.0 (fitfilesfixer; contact@fitfilesfixer.com)");
+    c.DefaultRequestHeaders.Accept.ParseAdd("application/json");
+});
+
 const string validApiKey = "RUSNI_PYZDA";
 var app = builder.Build();
 app.UseForwardedHeaders();
@@ -42,14 +51,178 @@ string GetConnectionString()
 }
 
 // ---------------------------------------------------------------------------
-// GET /  — upload form
+// GET /api/geolocate  — returns best-guess city for the caller's IP
 // ---------------------------------------------------------------------------
+app.MapGet("/api/geolocate", async (HttpRequest request, IHttpClientFactory httpClientFactory) =>
+{
+    var ip = request.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "";
+    if (string.IsNullOrEmpty(ip) || ip == "unknown" || Helpers.IsPrivateIp(ip))
+        return Results.Json(new { city = "Kharkiv", lat = 49.9935, lon = 36.2304 });
+
+    try
+    {
+        var geo  = httpClientFactory.CreateClient("geo");
+        var resp = await geo.GetAsync($"/json/{ip}?fields=status,city,lat,lon");
+        if (resp.IsSuccessStatusCode)
+        {
+            var json = await resp.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("status", out var st) && st.GetString() == "success")
+            {
+                var city = root.TryGetProperty("city", out var c) ? c.GetString() : null;
+                var lat  = root.TryGetProperty("lat",  out var la) ? la.GetDouble() : 49.9935;
+                var lon  = root.TryGetProperty("lon",  out var lo) ? lo.GetDouble() : 36.2304;
+                if (!string.IsNullOrEmpty(city))
+                    return Results.Json(new { city, lat, lon });
+            }
+        }
+    }
+    catch { }
+
+    return Results.Json(new { city = "Kharkiv", lat = 49.9935, lon = 36.2304 });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/cities?q=...  — city autocomplete via Nominatim (OpenStreetMap)
+// ---------------------------------------------------------------------------
+app.MapGet("/api/cities", async (string? q, IHttpClientFactory httpClientFactory) =>
+{
+    if (string.IsNullOrWhiteSpace(q) || q.Length < 2)
+        return Results.Json(Array.Empty<object>());
+
+    try
+    {
+        var client = httpClientFactory.CreateClient("nominatim");
+        // featureType=city  — restricts results to populated places
+        // addressdetails=0  — we don't need the full address breakdown
+        var url = $"/search?q={Uri.EscapeDataString(q)}&format=jsonv2&limit=8&featureType=city&addressdetails=1&accept-language=en";
+        var resp = await client.GetAsync(url);
+        if (!resp.IsSuccessStatusCode)
+            return Results.Json(Array.Empty<object>());
+
+        var json = await resp.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+
+        var results = doc.RootElement.EnumerateArray()
+            .Select(el =>
+            {
+                // Build a readable "City, Country" display name from address details
+                // when available; fall back to Nominatim's own display_name.
+                var addr       = el.TryGetProperty("address",      out var a)  ? a  : (JsonElement?)null;
+                var city       = GetAddrPart(addr, "city", "town", "village", "municipality");
+                var country    = GetAddrPart(addr, "country");
+                var displayName = (!string.IsNullOrEmpty(city) && !string.IsNullOrEmpty(country))
+                    ? $"{city}, {country}"
+                    : el.TryGetProperty("display_name", out var dn) ? dn.GetString() ?? "" : "";
+
+                var lat = el.TryGetProperty("lat", out var la) && double.TryParse(la.GetString(),
+                              System.Globalization.NumberStyles.Float,
+                              System.Globalization.CultureInfo.InvariantCulture, out var latV) ? latV : 0.0;
+                var lon = el.TryGetProperty("lon", out var lo) && double.TryParse(lo.GetString(),
+                              System.Globalization.NumberStyles.Float,
+                              System.Globalization.CultureInfo.InvariantCulture, out var lonV) ? lonV : 0.0;
+
+                return new { name = displayName, lat, lon };
+            })
+            .Where(x => !string.IsNullOrEmpty(x.name) && (x.lat != 0.0 || x.lon != 0.0))
+            .ToArray();
+
+        return Results.Json(results);
+    }
+    catch
+    {
+        return Results.Json(Array.Empty<object>());
+    }
+
+    static string? GetAddrPart(JsonElement? addr, params string[] keys)
+    {
+        if (addr is null) return null;
+        foreach (var key in keys)
+            if (addr.Value.TryGetProperty(key, out var v))
+                return v.GetString();
+        return null;
+    }
+});
+
+
 app.MapGet("/", (HttpRequest request, HttpResponse response) =>
 {
     var lang = Lang.Detect(request);
     Lang.SetCookie(response, lang);
 
     string T(string k) => Lang.T(k, lang);
+
+    // Built as plain string concatenation — no $@"" escaping headaches with
+    // double-quotes inside JS strings (city-item, selectCity, regex literals).
+    var uploadScript =
+        "<script>\n" +
+        "var _a, _b;\n" +
+        "function newCaptcha() {\n" +
+        "  _a = Math.floor(Math.random() * 12) + 1;\n" +
+        "  _b = Math.floor(Math.random() * 12) + 1;\n" +
+        "  document.getElementById('captcha-q').textContent = _a + ' + ' + _b;\n" +
+        "  document.getElementById('captcha-ans').value = '';\n" +
+        "  document.getElementById('captcha-err').style.display = 'none';\n" +
+        "}\n" +
+        "newCaptcha();\n" +
+        "function showFileName(input) {\n" +
+        "  var el = document.getElementById('file-name');\n" +
+        "  if (input.files && input.files[0]) { el.textContent = input.files[0].name; el.style.display = 'block'; }\n" +
+        "}\n" +
+        "var dz = document.getElementById('drop-zone');\n" +
+        "dz.addEventListener('dragover', function(e) { e.preventDefault(); dz.style.background = '#f0f0f0'; });\n" +
+        "dz.addEventListener('dragleave', function() { dz.style.background = ''; });\n" +
+        "dz.addEventListener('drop', function(e) {\n" +
+        "  e.preventDefault(); dz.style.background = '';\n" +
+        "  var dt = new DataTransfer(); dt.items.add(e.dataTransfer.files[0]);\n" +
+        "  var fi = document.getElementById('fit-file'); fi.files = dt.files; showFileName(fi);\n" +
+        "});\n" +
+        "var _cityDebounce = null, _currentSuggestions = [];\n" +
+        "function onCityInput(val) {\n" +
+        "  clearTimeout(_cityDebounce);\n" +
+        "  if (val.length < 2) { hideSuggestions(); return; }\n" +
+        "  _cityDebounce = setTimeout(function() {\n" +
+        "    fetch('/api/cities?q=' + encodeURIComponent(val))\n" +
+        "      .then(function(r) { return r.json(); }).then(showSuggestions).catch(function() {});\n" +
+        "  }, 180);\n" +
+        "}\n" +
+        "function showSuggestions(cities) {\n" +
+        "  var box = document.getElementById('citySuggestions');\n" +
+        "  _currentSuggestions = cities;\n" +
+        "  if (!cities.length) { box.style.display = 'none'; return; }\n" +
+        "  box.innerHTML = cities.map(function(c, i) {\n" +
+        "    return '<div class=\"city-item\" onmousedown=\"selectCity(' + i + ')\">' + escHtml(c.name) + '</div>';\n" +
+        "  }).join('');\n" +
+        "  box.style.display = 'block';\n" +
+        "}\n" +
+        "function selectCity(i) {\n" +
+        "  var c = _currentSuggestions[i]; if (!c) return;\n" +
+        "  document.getElementById('startCity').value = c.name;\n" +
+        "  document.getElementById('startLat').value  = c.lat;\n" +
+        "  document.getElementById('startLon').value  = c.lon;\n" +
+        "  hideSuggestions();\n" +
+        "}\n" +
+        "function hideSuggestions() { setTimeout(function() { document.getElementById('citySuggestions').style.display = 'none'; }, 120); }\n" +
+        "function escHtml(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }\n" +
+        "(function() {\n" +
+        "  fetch('/api/geolocate').then(function(r) { return r.json(); }).then(function(d) {\n" +
+        "    if (d && d.city) {\n" +
+        "      document.getElementById('startCity').value = d.city;\n" +
+        "      document.getElementById('startLat').value  = d.lat;\n" +
+        "      document.getElementById('startLon').value  = d.lon;\n" +
+        "    }\n" +
+        "  }).catch(function() {});\n" +
+        "})();\n" +
+        "function handleSubmit() {\n" +
+        "  var ans = parseInt(document.getElementById('captcha-ans').value, 10);\n" +
+        "  if (isNaN(ans) || ans !== _a + _b) {\n" +
+        "    document.getElementById('captcha-err').style.display = 'block';\n" +
+        "    newCaptcha(); return;\n" +
+        "  }\n" +
+        "  document.getElementById('upload-form').submit();\n" +
+        "}\n" +
+        "</script>";
 
     var html = $@"
 <html>
@@ -85,6 +258,8 @@ app.MapGet("/", (HttpRequest request, HttpResponse response) =>
 <form action='/process' method='post' enctype='multipart/form-data' id='upload-form'>
   <input type='hidden' name='apiKey' value='RUSNI_PYZDA' />
   <input type='hidden' name='lang' value='{lang}' />
+  <input type='hidden' name='startLat' id='startLat' value=''>
+  <input type='hidden' name='startLon' id='startLon' value=''>
 
   <div class='field'>
     <label>{T("upload.file_label")}</label>
@@ -96,6 +271,24 @@ app.MapGet("/", (HttpRequest request, HttpResponse response) =>
       <div class='file-hint'>{T("upload.hint")}</div>
       <div id='file-name'></div>
       <input type='file' id='fit-file' name='file' accept='.fit' style='display:none' onchange='showFileName(this)'>
+    </div>
+  </div>
+
+  <div class='field'>
+    <label>{T("upload.start_label")}</label>
+    <div class='city-wrap'>
+      <input type='text' id='startCity' placeholder='{T("upload.start_ph")}' autocomplete='off' oninput='onCityInput(this.value)' onblur='hideSuggestions()'>
+      <div class='city-suggestions' id='citySuggestions'></div>
+    </div>
+    <div class='field-hint'>{T("upload.start_hint")}</div>
+  </div>
+
+  <div class='field'>
+    <label>{T("upload.threshold_label")}</label>
+    <div class='threshold-row'>
+      <input type='number' id='threshold' name='threshold' value='70' min='5' max='100' step='1'>
+      <span class='threshold-unit'>{T("upload.threshold_unit")}</span>
+      <span class='threshold-hint'>{T("upload.threshold_hint")}</span>
     </div>
   </div>
 
@@ -114,47 +307,7 @@ app.MapGet("/", (HttpRequest request, HttpResponse response) =>
   </div>
 </form>
 
-<script>
-var _a, _b;
-function newCaptcha() {{
-  _a = Math.floor(Math.random() * 12) + 1;
-  _b = Math.floor(Math.random() * 12) + 1;
-  document.getElementById('captcha-q').textContent = _a + ' + ' + _b;
-  document.getElementById('captcha-ans').value = '';
-  document.getElementById('captcha-err').style.display = 'none';
-}}
-newCaptcha();
-
-function showFileName(input) {{
-  var el = document.getElementById('file-name');
-  if (input.files && input.files[0]) {{
-    el.textContent = input.files[0].name;
-    el.style.display = 'block';
-  }}
-}}
-
-var dz = document.getElementById('drop-zone');
-dz.addEventListener('dragover', function(e) {{ e.preventDefault(); dz.style.background = '#f0f0f0'; }});
-dz.addEventListener('dragleave', function() {{ dz.style.background = ''; }});
-dz.addEventListener('drop', function(e) {{
-  e.preventDefault(); dz.style.background = '';
-  var dt = new DataTransfer();
-  dt.items.add(e.dataTransfer.files[0]);
-  var fi = document.getElementById('fit-file');
-  fi.files = dt.files;
-  showFileName(fi);
-}});
-
-function handleSubmit() {{
-  var ans = parseInt(document.getElementById('captcha-ans').value, 10);
-  if (isNaN(ans) || ans !== _a + _b) {{
-    document.getElementById('captcha-err').style.display = 'block';
-    newCaptcha();
-    return;
-  }}
-  document.getElementById('upload-form').submit();
-}}
-</script>
+{uploadScript}
 
 {SharedCss.Footer(lang)}
 </body></html>";
@@ -180,6 +333,30 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
     string T(string k) => Lang.T(k, lang);
 
     var clientIp = request.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+
+    // ---- SPEED LIMIT PARAMETER ----
+    // Maximum plausible speed in km/h. Any point that would require exceeding
+    // this speed from the previous valid point is treated as corrupt.
+    double maxSpeedKmh = 70.0;
+    if (double.TryParse(form["threshold"].ToString(), out var parsedSpeed))
+        maxSpeedKmh = Math.Clamp(parsedSpeed, 5, 100);
+    double maxSpeedMs = maxSpeedKmh / 3.6;
+
+    // ---- START AREA PARAMETER ----
+    // Center point used to validate the very first GPS point in the file.
+    // If the first candidate is further than START_AREA_RADIUS_KM from this
+    // center, it is treated as a pre-start glitch and discarded.
+    const double START_AREA_RADIUS_M = 50_000.0; // 50 km
+    double? startLat = null, startLon = null;
+    if (double.TryParse(form["startLat"].ToString(), System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out var sLat) &&
+        double.TryParse(form["startLon"].ToString(), System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out var sLon) &&
+        sLat >= -90 && sLat <= 90 && sLon >= -180 && sLon <= 180)
+    {
+        startLat = sLat;
+        startLon = sLon;
+    }
 
     // ---- API KEY CHECK ----
     var apiKey = form["apiKey"].ToString();
@@ -237,48 +414,32 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
     await using (var fs = File.Create(inputPath))
         await file.CopyToAsync(fs);
 
-    int nullCoords = 0, outsideRegionCoords = 0, fixedPoints = 0, totalPoints = 0;
+    int nullCoords = 0, jumpCoords = 0, fixedPoints = 0, totalPoints = 0;
     int droppedTimestamp = 0, droppedDuplicate = 0, droppedCorrupt = 0;
+    var trackPoints = new List<TrackPoint>();
 
     try
     {
         var messages = FitHelpers.ReadAllMessages(inputPath);
 
-        const double MIN_LAT = 44.0, MAX_LAT = 53.0;
-        const double MIN_LON = 22.0, MAX_LON = 41.0;
         const uint MIN_VALID_FIT_TS = 315619200u;
         const uint MAX_VALID_FIT_TS = 1420156800u;
 
-        double defaultLatDeg = 49.969490, defaultLonDeg = 36.193652;
-        int defaultLat = FitHelpers.DegreesToSemicircles(defaultLatDeg);
-        int defaultLon = FitHelpers.DegreesToSemicircles(defaultLonDeg);
-        Dynastream.Fit.DateTime? defaultTime = null;
+        // lastValid*: anchor of the most recently accepted genuine point.
+        // Updated only when a point passes the speed check (or is the very
+        // first point). Fixed/clamped points never update it, which prevents
+        // the cascade-collapse bug where every post-glitch point gets fixed
+        // because the anchor stayed frozen at the pre-glitch position.
+        double? lastValidLatDeg = null;
+        double? lastValidLonDeg = null;
+        uint?   lastValidTs     = null;
 
-        foreach (var m in messages)
-        {
-            if (!string.Equals(m.Name, "record", StringComparison.OrdinalIgnoreCase)) continue;
-            var record = new RecordMesg(m);
-            int? lat = record.GetPositionLat();
-            int? lon = record.GetPositionLong();
-            if (lat == null || lon == null) continue;
-            double latDeg = FitHelpers.SemicirclesToDegrees(lat.Value);
-            double lonDeg = FitHelpers.SemicirclesToDegrees(lon.Value);
-            if (FitHelpers.IsInsideUkraine(latDeg, lonDeg, MIN_LAT, MAX_LAT, MIN_LON, MAX_LON))
-            {
-                defaultLat = lat.Value;
-                defaultLon = lon.Value;
-                var ts = record.GetTimestamp();
-                if (ts != null) defaultTime = ts;
-                break;
-            }
-        }
-
-        int? lastValidLat = null, lastValidLon = null;
         bool fileIdSeen = false;
         var cleanMessages = new List<Mesg>();
 
         foreach (var m in messages)
         {
+            // ---- Drop duplicate file_id ----
             if (m.Num == MesgNum.FileId)
             {
                 if (fileIdSeen) { droppedDuplicate++; continue; }
@@ -286,11 +447,15 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
                 cleanMessages.Add(m);
                 continue;
             }
+
+            // ---- Drop entirely corrupt messages ----
             if (m.Num == MesgNum.Invalid)
             {
                 droppedCorrupt++;
                 continue;
             }
+
+            // ---- Non-record messages: only check timestamp validity ----
             if (!string.Equals(m.Name, "record", StringComparison.OrdinalIgnoreCase))
             {
                 var tsField = m.GetField(253);
@@ -304,14 +469,22 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
                 continue;
             }
 
+            // ---- Record message ----
             totalPoints++;
-            var rec    = new RecordMesg(m);
+            var rec     = new RecordMesg(m);
             int? recLat = rec.GetPositionLat();
             int? recLon = rec.GetPositionLong();
 
+            // Extract a valid FIT timestamp for this record, if present.
+            uint? recTs = rec.GetField(253)?.GetValue() is uint rts &&
+                          rts >= MIN_VALID_FIT_TS && rts <= MAX_VALID_FIT_TS
+                          ? rts : (uint?)null;
+
             bool needsFix = false;
+
             if (recLat == null || recLon == null)
             {
+                // Missing coordinates — always fix.
                 nullCoords++;
                 needsFix = true;
             }
@@ -319,36 +492,81 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
             {
                 double latDeg = FitHelpers.SemicirclesToDegrees(recLat.Value);
                 double lonDeg = FitHelpers.SemicirclesToDegrees(recLon.Value);
-                if (!FitHelpers.IsInsideUkraine(latDeg, lonDeg, MIN_LAT, MAX_LAT, MIN_LON, MAX_LON))
-                {
-                    outsideRegionCoords++;
-                    needsFix = true;
-                }
-            }
 
-            bool tsBad = rec.GetField(253)?.GetValue() is uint rts &&
-                         (rts < MIN_VALID_FIT_TS || rts > MAX_VALID_FIT_TS);
-
-            if (needsFix || tsBad)
-            {
-                if (lastValidLat != null)
+                if (!lastValidLatDeg.HasValue)
                 {
-                    rec.SetPositionLat(lastValidLat.Value);
-                    rec.SetPositionLong(lastValidLon!.Value);
+                    // No anchor yet.
+                    // If a start area was provided, only accept this point
+                    // when it is within START_AREA_RADIUS_M of the center —
+                    // anything further is a pre-start GPS glitch.
+                    // Without a start area, accept the first point unconditionally.
+                    bool withinStartArea = !startLat.HasValue ||
+                        FitHelpers.HaversineMeters(startLat.Value, startLon!.Value,
+                                                   latDeg, lonDeg) <= START_AREA_RADIUS_M;
+
+                    if (withinStartArea)
+                    {
+                        lastValidLatDeg = latDeg;
+                        lastValidLonDeg = lonDeg;
+                        lastValidTs     = recTs;
+                    }
+                    else
+                    {
+                        jumpCoords++;
+                        needsFix = true;
+                    }
                 }
                 else
                 {
-                    rec.SetPositionLat(defaultLat);
-                    rec.SetPositionLong(defaultLon);
+                    double dist = FitHelpers.HaversineMeters(
+                        lastValidLatDeg.Value, lastValidLonDeg!.Value,
+                        latDeg, lonDeg);
+
+                    // Maximum distance coverable at the configured speed limit
+                    // over the elapsed time between this point and the anchor.
+                    // Use real elapsed seconds when timestamps are available
+                    // and monotonically increasing; fall back to 1 s otherwise
+                    // (conservative: ~19 m at 70 km/h — catches any 180°-flip
+                    // glitch while still allowing normal inter-point movement).
+                    double dtSeconds = 1.0;
+                    if (recTs.HasValue && lastValidTs.HasValue && recTs.Value > lastValidTs.Value)
+                        dtSeconds = recTs.Value - lastValidTs.Value;
+
+                    double maxAllowedDist = maxSpeedMs * dtSeconds;
+
+                    if (dist > maxAllowedDist)
+                    {
+                        jumpCoords++;
+                        needsFix = true;
+                    }
+                    // else: reachable at the configured speed — valid.
                 }
-                if (tsBad && defaultTime != null)
-                    rec.SetTimestamp(defaultTime);
-                if (needsFix) fixedPoints++;
             }
-            else
+
+            if (needsFix)
             {
-                lastValidLat = recLat;
-                lastValidLon = recLon;
+                // Clamp priority:
+                //   1. Last known-good anchor (normal case)
+                //   2. Start area center (no anchor yet, but user provided one)
+                //   3. Leave unset — encoder emits a gap (last resort)
+                double? clampLat = lastValidLatDeg ?? startLat;
+                double? clampLon = lastValidLonDeg ?? startLon;
+
+                if (clampLat.HasValue)
+                {
+                    rec.SetPositionLat(FitHelpers.DegreesToSemicircles(clampLat.Value));
+                    rec.SetPositionLong(FitHelpers.DegreesToSemicircles(clampLon!.Value));
+                    trackPoints.Add(new TrackPoint(clampLat.Value, clampLon.Value, Fixed: true));
+                }
+                fixedPoints++;
+            }
+            else if (recLat != null && recLon != null)
+            {
+                // Valid point — update the anchor.
+                lastValidLatDeg = FitHelpers.SemicirclesToDegrees(recLat.Value);
+                lastValidLonDeg = FitHelpers.SemicirclesToDegrees(recLon.Value);
+                lastValidTs     = recTs;
+                trackPoints.Add(new TrackPoint(lastValidLatDeg.Value, lastValidLonDeg.Value, Fixed: false));
             }
 
             cleanMessages.Add(rec);
@@ -389,6 +607,82 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
 
     var downloadUrl = $"/download?file={Uri.EscapeDataString(savedFileName)}&name={Uri.EscapeDataString(outputName)}&lang={lang}";
 
+    // ---- Build compact track JSON for the map ----
+    // Subsample to at most 4000 points so the inline JSON stays manageable,
+    // but always keep every fixed point so they are visible on the map.
+    var mapPoints = TrackSampler.Subsample(trackPoints, maxPoints: 4000);
+    // Serialize as a flat array of [lat, lon, fixed] triples for minimum size.
+    var trackJson = "[" + string.Join(",",
+        mapPoints.Select(p => $"[{p.Lat:F6},{p.Lon:F6},{(p.Fixed ? 1 : 0)}]")) + "]";
+
+    var mapSection = "";
+    if (mapPoints.Count > 0)
+    {
+        // Resolve localised labels before embedding in JS — avoids any
+        // quote-escaping issues inside the $@"..." interpolated string.
+        var lblStart  = T("result.map_start");
+        var lblEnd    = T("result.map_end");
+        var lblOk     = T("result.map_ok");
+        var lblFixed  = T("result.map_fixed");
+        var lblTitle  = T("result.map_section");
+
+        // The JS is built as a plain $"..." (non-verbatim) string so we can
+        // use \n for newlines and avoid all {{ }} escaping entirely.
+        // Single quotes are used for all HTML attribute values inside JS strings.
+        var mapScript = "<script>\n" +
+            "(function(){\n" +
+            $"  var pts = {trackJson};\n" +
+            $"  var lblOk = '{lblOk}', lblFixed = '{lblFixed}';\n" +
+            "  if (!pts.length) return;\n" +
+            "  var map = L.map('map');\n" +
+            "  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {\n" +
+            "    attribution: '\\u00a9 <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a>',\n" +
+            "    maxZoom: 19\n" +
+            "  }).addTo(map);\n" +
+            "  var segments = [], cur = null;\n" +
+            "  for (var i = 0; i < pts.length; i++) {\n" +
+            "    var isFixed = pts[i][2] === 1;\n" +
+            "    if (!cur || cur.fixed !== isFixed) { cur = { fixed: isFixed, coords: [] }; segments.push(cur); }\n" +
+            "    cur.coords.push([pts[i][0], pts[i][1]]);\n" +
+            "    if (segments.length > 1 && cur.coords.length === 1) {\n" +
+            "      var prev = segments[segments.length - 2];\n" +
+            "      cur.coords.unshift(prev.coords[prev.coords.length - 1]);\n" +
+            "    }\n" +
+            "  }\n" +
+            "  var allCoords = pts.map(function(p){ return [p[0], p[1]]; });\n" +
+            "  var bounds = L.latLngBounds(allCoords);\n" +
+            "  var hasFixed = false;\n" +
+            "  segments.forEach(function(seg) {\n" +
+            "    if (seg.fixed) hasFixed = true;\n" +
+            "    L.polyline(seg.coords, {\n" +
+            "      color:   seg.fixed ? '#e53e3e' : '#2563eb',\n" +
+            "      weight:  3,\n" +
+            "      opacity: seg.fixed ? 0.9 : 0.75\n" +
+            "    }).addTo(map);\n" +
+            "  });\n" +
+            "  var legend = document.getElementById('map-legend');\n" +
+            "  if (legend) {\n" +
+            "    legend.innerHTML =\n" +
+            "      '<span class=\"legend-item\"><span class=\"legend-dot ok\"></span>' + lblOk + '</span>' +\n" +
+            "      (hasFixed ? ' <span class=\"legend-item\"><span class=\"legend-dot fixed\"></span>' + lblFixed + '</span>' : '');\n" +
+            "  }\n" +
+            "  var first = pts[0], last = pts[pts.length - 1];\n" +
+            "  var pin = 'width:12px;height:12px;border-radius:50%;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.4)';\n" +
+            $"  L.marker([first[0],first[1]], {{icon:L.divIcon({{html:'<div style=\"'+pin+';background:#16a34a\"></div>',className:'',iconAnchor:[6,6]}})}}).bindTooltip('{lblStart}').addTo(map);\n" +
+            $"  L.marker([last[0],last[1]],   {{icon:L.divIcon({{html:'<div style=\"'+pin+';background:#dc2626\"></div>',className:'',iconAnchor:[6,6]}})}}).bindTooltip('{lblEnd}').addTo(map);\n" +
+            "  map.fitBounds(bounds, { padding: [24, 24] });\n" +
+            "})();\n" +
+            "</script>";
+
+        mapSection =
+            $"<p class='section-label'>{lblTitle}</p>\n" +
+            "<div id='map'></div>\n" +
+            "<div class='map-legend' id='map-legend'></div>\n" +
+            "<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'/>\n" +
+            "<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>\n" +
+            mapScript;
+    }
+
     var htmlSuccess = $@"
 <html>
 <head>
@@ -417,7 +711,7 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
 <div class='kpi-grid'>
   <div class='kpi'><div class='val'>{totalPoints}</div><div class='lbl'>{T("result.total")}</div></div>
   <div class='kpi'><div class='val'>{nullCoords}</div><div class='lbl'>{T("result.null")}</div></div>
-  <div class='kpi'><div class='val'>{outsideRegionCoords}</div><div class='lbl'>{T("result.outside")}</div></div>
+  <div class='kpi'><div class='val'>{jumpCoords}</div><div class='lbl'>{string.Format(T("result.jump"), (int)maxSpeedKmh)}</div></div>
   <div class='kpi'><div class='val good'>{fixedPoints}</div><div class='lbl'>{T("result.fixed")}</div></div>
 </div>
 
@@ -429,6 +723,8 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IHttp
   <div class='drop-badge'>{string.Format(T("result.dup"), droppedDuplicate)}</div>
   <div class='drop-badge'>{string.Format(T("result.corrupt"), droppedCorrupt)}</div>
 </div>
+
+{mapSection}
 
 <div class='tip'>
   <svg width='16' height='16' viewBox='0 0 16 16' fill='none'>
@@ -678,6 +974,11 @@ static class SharedCss
   .field { margin-bottom: 20px; }
   input[type=text] { border: 1px solid #ccc; border-radius: 8px; padding: 8px 12px; font-size: 14px; outline: none; }
   input[type=text]:focus { border-color: #999; }
+  input[type=number] { border: 1px solid #ccc; border-radius: 8px; padding: 8px 12px; font-size: 14px; outline: none; width: 100px; }
+  input[type=number]:focus { border-color: #999; }
+  .threshold-row { display: flex; align-items: center; gap: 10px; }
+  .threshold-unit { font-size: 14px; color: #444; }
+  .threshold-hint { font-size: 12px; color: #999; }
   .upload-area { border: 1px dashed #bbb; border-radius: 12px; padding: 24px; text-align: center; cursor: pointer; background: #fafafa; transition: background 0.15s; }
   .upload-area:hover { background: #f0f0f0; }
   .file-hint { font-size: 12px; color: #888; margin-top: 6px; }
@@ -701,7 +1002,19 @@ static class SharedCss
   .donate-text { color: #fff; }
   .donate-text strong { display: block; font-size: 15px; font-weight: 500; }
   .donate-text span { font-size: 13px; opacity: 0.85; }
-  .donate-btn { background: #ffd700; color: #0057b8; font-size: 13px; font-weight: 500; border-radius: 6px; padding: 8px 18px; white-space: nowrap; flex-shrink: 0; }";
+  .donate-btn { background: #ffd700; color: #0057b8; font-size: 13px; font-weight: 500; border-radius: 6px; padding: 8px 18px; white-space: nowrap; flex-shrink: 0; }
+  .city-wrap { position: relative; display: inline-block; width: 280px; }
+  .city-wrap input[type=text] { width: 100%; box-sizing: border-box; }
+  .city-suggestions { position: absolute; top: 100%; left: 0; right: 0; background: #fff; border: 1px solid #ccc; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,.1); z-index: 100; display: none; max-height: 220px; overflow-y: auto; margin-top: 2px; }
+  .city-item { padding: 8px 12px; font-size: 14px; cursor: pointer; }
+  .city-item:hover { background: #f5f5f5; }
+  .field-hint { font-size: 12px; color: #999; margin-top: 5px; }
+  #map { width: 100%; height: 420px; border-radius: 12px; border: 1px solid #ddd; margin-bottom: 8px; }
+  .map-legend { display: flex; gap: 16px; margin-bottom: 24px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #444; }
+  .legend-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+  .legend-dot.ok { background: #2563eb; }
+  .legend-dot.fixed { background: #e53e3e; }";
 }
 
 // ---------------------------------------------------------------------------
@@ -738,64 +1051,77 @@ function setLang(l){{
 
     private static readonly Dictionary<string, Dictionary<string, string>> Strings = new()
     {
-        ["upload.title"]         = new() { ["en"] = "FIT Fixer",                                                ["uk"] = "FIT Fixer" },
-        ["upload.sub"]           = new() { ["en"] = "Remove GPS jumps outside Ukraine while keeping sensor data", ["uk"] = "Видаляє стрибки GPS за межі України, зберігаючи дані датчиків" },
-        ["upload.tip"]           = new() { ["en"] = "Upload a <strong>.fit</strong> file recorded by your Garmin or other device. The service fixes coordinate jumps outside Ukraine and repairs corrupt timestamps.",
-                                            ["uk"] = "Завантажте файл <strong>.fit</strong>, записаний вашим Garmin або іншим пристроєм. Сервіс виправляє стрибки координат за межі України та пошкоджені часові мітки." },
-        ["upload.section"]       = new() { ["en"] = "Upload",                     ["uk"] = "Завантаження" },
-        ["upload.file_label"]    = new() { ["en"] = "FIT file",                   ["uk"] = "FIT-файл" },
-        ["upload.click"]         = new() { ["en"] = "Click to choose a file",     ["uk"] = "Натисніть, щоб вибрати файл" },
-        ["upload.hint"]          = new() { ["en"] = "or drag and drop · .fit · max 5 MB", ["uk"] = "або перетягніть · .fit · макс. 5 МБ" },
-        ["upload.captcha_label"] = new() { ["en"] = "Human check — solve to continue", ["uk"] = "Перевірка — вирішіть приклад" },
-        ["upload.captcha_eq"]    = new() { ["en"] = "=",                          ["uk"] = "=" },
-        ["upload.captcha_ph"]    = new() { ["en"] = "?",                          ["uk"] = "?" },
-        ["upload.captcha_err"]   = new() { ["en"] = "Incorrect answer — please try again", ["uk"] = "Неправильна відповідь — спробуйте ще раз" },
-        ["upload.submit"]        = new() { ["en"] = "Upload &amp; Fix",           ["uk"] = "Завантажити та виправити" },
-        ["upload.stats_link"]    = new() { ["en"] = "View stats →",               ["uk"] = "Статистика →" },
-        ["result.sub"]           = new() { ["en"] = "Completed in {0} ms",        ["uk"] = "Виконано за {0} мс" },
-        ["result.coord_section"] = new() { ["en"] = "Coordinate stats",           ["uk"] = "Статистика координат" },
-        ["result.total"]         = new() { ["en"] = "Total record points",        ["uk"] = "Всього точок" },
-        ["result.null"]          = new() { ["en"] = "Null coordinates",           ["uk"] = "Порожні координати" },
-        ["result.outside"]       = new() { ["en"] = "Outside UA",                 ["uk"] = "Поза Україною" },
-        ["result.fixed"]         = new() { ["en"] = "Fixed points",               ["uk"] = "Виправлено точок" },
-        ["result.dropped"]       = new() { ["en"] = "Dropped messages",           ["uk"] = "Відкинуті повідомлення" },
-        ["result.bad_ts"]        = new() { ["en"] = "{0} bad timestamp",          ["uk"] = "{0} некоректна мітка часу" },
-        ["result.dup"]           = new() { ["en"] = "{0} duplicate file_id",      ["uk"] = "{0} дублікат file_id" },
-        ["result.corrupt"]       = new() { ["en"] = "{0} corrupt",                ["uk"] = "{0} пошкоджених" },
-        ["result.tip"]           = new() { ["en"] = "If uploading the fixed file to Strava fails, try uploading it to <a href='https://www.fitfileviewer.com/' target='_blank'>fitfileviewer.com</a> — it can repair additional issues and help get your activity uploaded.",
-                                            ["uk"] = "Якщо завантаження виправленого файлу до Strava не вдається, спробуйте <a href='https://www.fitfileviewer.com/' target='_blank'>fitfileviewer.com</a> — він може усунути додаткові проблеми." },
-        ["result.download"]      = new() { ["en"] = "Download {0}",               ["uk"] = "Завантажити {0}" },
-        ["result.upload_another"]= new() { ["en"] = "Upload another file",        ["uk"] = "Завантажити інший файл" },
-        ["denied.title"]         = new() { ["en"] = "Access Denied",              ["uk"] = "Доступ заборонено" },
-        ["denied.heading"]       = new() { ["en"] = "Invalid API Key",            ["uk"] = "Невірний ключ API" },
-        ["denied.body"]          = new() { ["en"] = "The API key you entered is incorrect.", ["uk"] = "Введений ключ API є невірним." },
-        ["denied.back"]          = new() { ["en"] = "← Return to upload page",    ["uk"] = "← Повернутися до завантаження" },
-        ["stats.title"]          = new() { ["en"] = "FIT Fixer — Stats",          ["uk"] = "FIT Fixer — Статистика" },
-        ["stats.heading"]        = new() { ["en"] = "Request Statistics",         ["uk"] = "Статистика запитів" },
-        ["stats.back"]           = new() { ["en"] = "← Upload page",              ["uk"] = "← Сторінка завантаження" },
-        ["stats.summary"]        = new() { ["en"] = "Summary",                    ["uk"] = "Зведення" },
-        ["stats.total"]          = new() { ["en"] = "Total requests",             ["uk"] = "Всього запитів" },
-        ["stats.succeeded"]      = new() { ["en"] = "Succeeded",                  ["uk"] = "Успішних" },
-        ["stats.failed"]         = new() { ["en"] = "Failed",                     ["uk"] = "Помилок" },
-        ["stats.avg_ms"]         = new() { ["en"] = "Avg processing time",        ["uk"] = "Сер. час обробки" },
-        ["stats.sum_points"]     = new() { ["en"] = "Total points processed",     ["uk"] = "Всього точок оброблено" },
-        ["stats.sum_fixed"]      = new() { ["en"] = "Total points fixed",         ["uk"] = "Всього точок виправлено" },
-        ["stats.unique_ips"]     = new() { ["en"] = "Unique IPs",                 ["uk"] = "Унікальних IP" },
-        ["stats.by_country"]     = new() { ["en"] = "Requests by country",        ["uk"] = "Запити за країнами" },
-        ["stats.country"]        = new() { ["en"] = "Country",                    ["uk"] = "Країна" },
-        ["stats.requests"]       = new() { ["en"] = "Requests",                   ["uk"] = "Запити" },
-        ["stats.last50"]         = new() { ["en"] = "Last 50 requests",           ["uk"] = "Останні 50 запитів" },
-        ["stats.col_time"]       = new() { ["en"] = "Time (UTC)",                 ["uk"] = "Час (UTC)" },
-        ["stats.col_ip"]         = new() { ["en"] = "IP",                         ["uk"] = "IP" },
-        ["stats.col_country"]    = new() { ["en"] = "Country",                    ["uk"] = "Країна" },
-        ["stats.col_city"]       = new() { ["en"] = "City",                       ["uk"] = "Місто" },
-        ["stats.col_file"]       = new() { ["en"] = "File",                       ["uk"] = "Файл" },
-        ["stats.col_size"]       = new() { ["en"] = "Size",                       ["uk"] = "Розмір" },
-        ["stats.col_points"]     = new() { ["en"] = "Points",                     ["uk"] = "Точки" },
-        ["stats.col_fixed"]      = new() { ["en"] = "Fixed",                      ["uk"] = "Виправл." },
-        ["stats.col_time2"]      = new() { ["en"] = "Time",                       ["uk"] = "Час" },
-        ["stats.col_ok"]         = new() { ["en"] = "OK",                         ["uk"] = "OK" },
-        ["stats.col_error"]      = new() { ["en"] = "Error",                      ["uk"] = "Помилка" },
+        ["upload.title"]            = new() { ["en"] = "FIT Fixer",                                                       ["uk"] = "FIT Fixer" },
+        ["upload.sub"]              = new() { ["en"] = "Fix GPS glitches in your activity file",                              ["uk"] = "Виправляє GPS-збої у файлі активності" },
+        ["upload.tip"]              = new() { ["en"] = "Upload a <strong>.fit</strong> file recorded by your Garmin or other device. The service detects GPS points that would require exceeding the configured speed limit to reach, and replaces them with the last valid position.",
+                                              ["uk"] = "Завантажте файл <strong>.fit</strong>, записаний вашим Garmin або іншим пристроєм. Сервіс виявляє GPS-точки, для досягнення яких потрібно перевищити задану швидкість, та замінює їх останньою коректною позицією." },
+        ["upload.section"]          = new() { ["en"] = "Upload",                          ["uk"] = "Завантаження" },
+        ["upload.file_label"]       = new() { ["en"] = "FIT file",                        ["uk"] = "FIT-файл" },
+        ["upload.click"]            = new() { ["en"] = "Click to choose a file",          ["uk"] = "Натисніть, щоб вибрати файл" },
+        ["upload.hint"]             = new() { ["en"] = "or drag and drop · .fit · max 5 MB", ["uk"] = "або перетягніть · .fit · макс. 5 МБ" },
+        ["upload.start_label"]      = new() { ["en"] = "Start area",                           ["uk"] = "Регіон старту" },
+        ["upload.start_ph"]         = new() { ["en"] = "City name…",                           ["uk"] = "Назва міста…" },
+        ["upload.start_hint"]       = new() { ["en"] = "First GPS point further than 50 km from this city is treated as a pre-start glitch",
+                                              ["uk"] = "Перша GPS-точка далі 50 км від цього міста вважається збоєм до старту" },
+        ["upload.threshold_label"]  = new() { ["en"] = "Max speed",                            ["uk"] = "Максимальна швидкість" },
+        ["upload.threshold_unit"]   = new() { ["en"] = "km/h",                                 ["uk"] = "км/год" },
+        ["upload.threshold_hint"]   = new() { ["en"] = "Points implying faster travel than this are treated as GPS glitches (default: 70 km/h, range: 5–100)",
+                                              ["uk"] = "Точки, що передбачають швидкість вище цієї, вважаються збоями GPS (за замовчуванням: 70 км/год, діапазон: 5–100)" },
+        ["upload.captcha_label"]    = new() { ["en"] = "Human check — solve to continue", ["uk"] = "Перевірка — вирішіть приклад" },
+        ["upload.captcha_eq"]       = new() { ["en"] = "=",                               ["uk"] = "=" },
+        ["upload.captcha_ph"]       = new() { ["en"] = "?",                               ["uk"] = "?" },
+        ["upload.captcha_err"]      = new() { ["en"] = "Incorrect answer — please try again", ["uk"] = "Неправильна відповідь — спробуйте ще раз" },
+        ["upload.submit"]           = new() { ["en"] = "Upload &amp; Fix",                ["uk"] = "Завантажити та виправити" },
+        ["upload.stats_link"]       = new() { ["en"] = "View stats →",                   ["uk"] = "Статистика →" },
+        ["result.sub"]              = new() { ["en"] = "Completed in {0} ms",             ["uk"] = "Виконано за {0} мс" },
+        ["result.coord_section"]    = new() { ["en"] = "Coordinate stats",                ["uk"] = "Статистика координат" },
+        ["result.total"]            = new() { ["en"] = "Total record points",             ["uk"] = "Всього точок" },
+        ["result.null"]             = new() { ["en"] = "Null coordinates",                ["uk"] = "Порожні координати" },
+        ["result.map_section"]      = new() { ["en"] = "Track map",                           ["uk"] = "Карта треку" },
+        ["result.map_ok"]           = new() { ["en"] = "Original track",                       ["uk"] = "Оригінальний трек" },
+        ["result.map_fixed"]        = new() { ["en"] = "Fixed points",                         ["uk"] = "Виправлені точки" },
+        ["result.map_start"]        = new() { ["en"] = "Start",                                ["uk"] = "Старт" },
+        ["result.map_end"]          = new() { ["en"] = "Finish",                               ["uk"] = "Фініш" },
+        ["result.jump"]             = new() { ["en"] = "Speed glitch >{0} km/h",               ["uk"] = "Збій швидкості >{0} км/год" },
+        ["result.fixed"]            = new() { ["en"] = "Fixed points",                    ["uk"] = "Виправлено точок" },
+        ["result.dropped"]          = new() { ["en"] = "Dropped messages",                ["uk"] = "Відкинуті повідомлення" },
+        ["result.bad_ts"]           = new() { ["en"] = "{0} bad timestamp",               ["uk"] = "{0} некоректна мітка часу" },
+        ["result.dup"]              = new() { ["en"] = "{0} duplicate file_id",           ["uk"] = "{0} дублікат file_id" },
+        ["result.corrupt"]          = new() { ["en"] = "{0} corrupt",                     ["uk"] = "{0} пошкоджених" },
+        ["result.tip"]              = new() { ["en"] = "If uploading the fixed file to Strava fails, try uploading it to <a href='https://www.fitfileviewer.com/' target='_blank'>fitfileviewer.com</a> — it can repair additional issues and help get your activity uploaded.",
+                                              ["uk"] = "Якщо завантаження виправленого файлу до Strava не вдається, спробуйте <a href='https://www.fitfileviewer.com/' target='_blank'>fitfileviewer.com</a> — він може усунути додаткові проблеми." },
+        ["result.download"]         = new() { ["en"] = "Download {0}",                    ["uk"] = "Завантажити {0}" },
+        ["result.upload_another"]   = new() { ["en"] = "Upload another file",             ["uk"] = "Завантажити інший файл" },
+        ["denied.title"]            = new() { ["en"] = "Access Denied",                   ["uk"] = "Доступ заборонено" },
+        ["denied.heading"]          = new() { ["en"] = "Invalid API Key",                 ["uk"] = "Невірний ключ API" },
+        ["denied.body"]             = new() { ["en"] = "The API key you entered is incorrect.", ["uk"] = "Введений ключ API є невірним." },
+        ["denied.back"]             = new() { ["en"] = "← Return to upload page",         ["uk"] = "← Повернутися до завантаження" },
+        ["stats.title"]             = new() { ["en"] = "FIT Fixer — Stats",               ["uk"] = "FIT Fixer — Статистика" },
+        ["stats.heading"]           = new() { ["en"] = "Request Statistics",              ["uk"] = "Статистика запитів" },
+        ["stats.back"]              = new() { ["en"] = "← Upload page",                   ["uk"] = "← Сторінка завантаження" },
+        ["stats.summary"]           = new() { ["en"] = "Summary",                         ["uk"] = "Зведення" },
+        ["stats.total"]             = new() { ["en"] = "Total requests",                  ["uk"] = "Всього запитів" },
+        ["stats.succeeded"]         = new() { ["en"] = "Succeeded",                       ["uk"] = "Успішних" },
+        ["stats.failed"]            = new() { ["en"] = "Failed",                          ["uk"] = "Помилок" },
+        ["stats.avg_ms"]            = new() { ["en"] = "Avg processing time",             ["uk"] = "Сер. час обробки" },
+        ["stats.sum_points"]        = new() { ["en"] = "Total points processed",          ["uk"] = "Всього точок оброблено" },
+        ["stats.sum_fixed"]         = new() { ["en"] = "Total points fixed",              ["uk"] = "Всього точок виправлено" },
+        ["stats.unique_ips"]        = new() { ["en"] = "Unique IPs",                      ["uk"] = "Унікальних IP" },
+        ["stats.by_country"]        = new() { ["en"] = "Requests by country",             ["uk"] = "Запити за країнами" },
+        ["stats.country"]           = new() { ["en"] = "Country",                         ["uk"] = "Країна" },
+        ["stats.requests"]          = new() { ["en"] = "Requests",                        ["uk"] = "Запити" },
+        ["stats.last50"]            = new() { ["en"] = "Last 50 requests",                ["uk"] = "Останні 50 запитів" },
+        ["stats.col_time"]          = new() { ["en"] = "Time (UTC)",                      ["uk"] = "Час (UTC)" },
+        ["stats.col_ip"]            = new() { ["en"] = "IP",                              ["uk"] = "IP" },
+        ["stats.col_country"]       = new() { ["en"] = "Country",                         ["uk"] = "Країна" },
+        ["stats.col_city"]          = new() { ["en"] = "City",                            ["uk"] = "Місто" },
+        ["stats.col_file"]          = new() { ["en"] = "File",                            ["uk"] = "Файл" },
+        ["stats.col_size"]          = new() { ["en"] = "Size",                            ["uk"] = "Розмір" },
+        ["stats.col_points"]        = new() { ["en"] = "Points",                          ["uk"] = "Точки" },
+        ["stats.col_fixed"]         = new() { ["en"] = "Fixed",                           ["uk"] = "Виправл." },
+        ["stats.col_time2"]         = new() { ["en"] = "Time",                            ["uk"] = "Час" },
+        ["stats.col_ok"]            = new() { ["en"] = "OK",                              ["uk"] = "OK" },
+        ["stats.col_error"]         = new() { ["en"] = "Error",                           ["uk"] = "Помилка" },
     };
 
     public static string T(string key, string lang)
@@ -803,6 +1129,16 @@ function setLang(l){{
             ? (d.TryGetValue(lang, out var s) ? s : d["en"])
             : key;
 }
+
+// ---------------------------------------------------------------------------
+// Track point for map rendering
+// ---------------------------------------------------------------------------
+
+/// <summary>
+/// A single GPS point collected after processing.
+/// <c>Fixed</c> is true when the coordinates were clamped by the fixer.
+/// </summary>
+record TrackPoint(double Lat, double Lon, bool Fixed);
 
 // ---------------------------------------------------------------------------
 // Request log data model
@@ -904,9 +1240,22 @@ static class Helpers
 
 static class FitHelpers
 {
-    public static bool IsInsideUkraine(double lat, double lon,
-        double minLat, double maxLat, double minLon, double maxLon)
-        => lat >= minLat && lat <= maxLat && lon >= minLon && lon <= maxLon;
+    /// <summary>
+    /// Returns the great-circle distance in metres between two WGS-84 points
+    /// using the Haversine formula.
+    /// </summary>
+    public static double HaversineMeters(double lat1, double lon1, double lat2, double lon2)
+    {
+        const double R = 6_371_000.0; // Earth radius in metres
+        double dLat = ToRad(lat2 - lat1);
+        double dLon = ToRad(lon2 - lon1);
+        double a = Math.Sin(dLat / 2) * Math.Sin(dLat / 2)
+                 + Math.Cos(ToRad(lat1)) * Math.Cos(ToRad(lat2))
+                 * Math.Sin(dLon / 2) * Math.Sin(dLon / 2);
+        return R * 2 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
+    }
+
+    private static double ToRad(double deg) => deg * Math.PI / 180.0;
 
     public static int DegreesToSemicircles(double degrees)
         => (int)(degrees * (Math.Pow(2, 31) / 180.0));
@@ -968,5 +1317,50 @@ static class SqliteExtensions
             rows.Add(row);
         }
         return rows;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Track subsampler
+// ---------------------------------------------------------------------------
+static class TrackSampler
+{
+    /// <summary>
+    /// Returns a subsampled copy of <paramref name="points"/> with at most
+    /// <paramref name="maxPoints"/> entries, preserving the spatial shape of
+    /// both valid and fixed segments.
+    ///
+    /// Strategy: uniform stride over the whole list. At each selected slot,
+    /// prefer a fixed point over a valid one (scan forward up to <c>step</c>
+    /// positions) so that repaired segments stay visible. When fixed points
+    /// alone exceed maxPoints, they are also strided uniformly — the map will
+    /// still show a coloured blob at the right location.
+    /// </summary>
+    public static List<TrackPoint> Subsample(List<TrackPoint> points, int maxPoints)
+    {
+        if (points.Count <= maxPoints)
+            return points;
+
+        // Uniform stride across the entire list.
+        double step = (double)points.Count / maxPoints;
+        var result = new List<TrackPoint>(maxPoints);
+
+        for (int slot = 0; slot < maxPoints; slot++)
+        {
+            // Centre of this slot's window in the source list.
+            int centre = (int)(slot * step + step / 2.0);
+            int lo     = (int)(slot * step);
+            int hi     = Math.Min(points.Count - 1, (int)((slot + 1) * step) - 1);
+
+            // Prefer the first fixed point in [lo..hi]; fall back to centre.
+            TrackPoint? chosen = null;
+            for (int j = lo; j <= hi; j++)
+            {
+                if (points[j].Fixed) { chosen = points[j]; break; }
+            }
+            result.Add(chosen ?? points[Math.Clamp(centre, 0, points.Count - 1)]);
+        }
+
+        return result;
     }
 }
