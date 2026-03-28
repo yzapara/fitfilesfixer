@@ -1,7 +1,7 @@
 using FitFilesFixer.Web.Models;
 using Microsoft.Data.Sqlite;
 
-namespace FitFilesFixer.Web.Data;
+namespace FitFilesFixer.Web.DataAccess;
 
 public class SqliteRequestLogRepository : IRequestLogRepository
 {

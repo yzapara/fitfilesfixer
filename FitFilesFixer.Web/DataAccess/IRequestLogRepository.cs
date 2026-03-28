@@ -1,6 +1,6 @@
 using FitFilesFixer.Web.Models;
 
-namespace FitFilesFixer.Web.Data;
+namespace FitFilesFixer.Web.DataAccess;
 
 public interface IRequestLogRepository
 {

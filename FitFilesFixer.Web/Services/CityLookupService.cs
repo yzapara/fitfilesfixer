@@ -33,6 +33,10 @@ public class CityLookupService : ICityLookupService
                     var addr = el.TryGetProperty("address", out var a) ? a : default(JsonElement);
                     var city = GetAddressPart(addr, "city", "town", "village", "municipality");
                     var country = GetAddressPart(addr, "country");
+
+                    if (IsBlockedCountry(country))
+                        return null;
+
                     var display = !string.IsNullOrEmpty(city) && !string.IsNullOrEmpty(country)
                         ? $"{city}, {country}"
                         : el.TryGetProperty("display_name", out var dn) ? dn.GetString() ?? string.Empty : string.Empty;
@@ -57,6 +61,13 @@ public class CityLookupService : ICityLookupService
         {
             return Array.Empty<CitySearchResult>();
         }
+    }
+
+    private static bool IsBlockedCountry(string? country)
+    {
+        if (string.IsNullOrEmpty(country)) return false;
+        var blocked = new[] { "Russia", "Belarus", "Iran", "North Korea" };
+        return blocked.Any(b => country.Contains(b, StringComparison.OrdinalIgnoreCase));
     }
 
     private static string? GetAddressPart(JsonElement addr, params string[] keys)

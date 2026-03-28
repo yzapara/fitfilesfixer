@@ -15,4 +15,5 @@ public record RequestLog
     public int ProcessingMs { get; init; }
     public bool Success { get; init; }
     public string? ErrorMessage { get; init; }
+    public string? SavedFileName { get; init; }
 }

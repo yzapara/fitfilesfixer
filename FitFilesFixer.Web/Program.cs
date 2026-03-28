@@ -5,7 +5,7 @@ using System.Net;
 using System.Text.Json;
 using Dynastream.Fit;
 using Microsoft.Data.Sqlite;
-using FitFilesFixer.Web.Data;
+using FitFilesFixer.Web.DataAccess;
 using FitFilesFixer.Web.Infrastructure;
 using FitFilesFixer.Web.Models;
 using FitFilesFixer.Web.Services;
@@ -65,6 +65,28 @@ string GetConnectionString()
     return $"Data Source={defaultPath}";
 }
 
+static void CleanupTempFiles(string directory, TimeSpan maxAge)
+{
+    try
+    {
+        if (!Directory.Exists(directory))
+            return;
+
+        var cutoff = System.DateTime.UtcNow - maxAge;
+        foreach (var filePath in Directory.EnumerateFiles(directory))
+        {
+            try
+            {
+                var fi = new FileInfo(filePath);
+                if (fi.LastWriteTimeUtc < cutoff)
+                    fi.Delete();
+            }
+            catch { /* ignore file-level cleanup errors */ }
+        }
+    }
+    catch { /* ignore cleanup errors */ }
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/geolocate  — returns best-guess city for the caller's IP
 // ---------------------------------------------------------------------------
@@ -85,12 +107,12 @@ app.MapGet("/api/cities", async (string? q, ICityLookupService cityLookup) =>
 });
 
 
-app.MapGet("/", (HttpRequest request, HttpResponse response) =>
+app.MapGet("/", (HttpRequest request, HttpResponse response, ILanguageService langService) =>
 {
-    var lang = Lang.Detect(request);
-    Lang.SetCookie(response, lang);
+    var lang = langService.Detect(request);
+    langService.SetCookie(response, lang);
 
-    string T(string k) => Lang.T(k, lang);
+    string T(string k) => langService.T(k, lang);
 
     // Built as plain string concatenation — no $@"" escaping headaches with
     // double-quotes inside JS strings (city-item, selectCity, regex literals).
@@ -181,7 +203,7 @@ app.MapGet("/", (HttpRequest request, HttpResponse response) =>
       <p class='sub'>{T("upload.sub")}</p>
     </div>
   </div>
-  {Lang.LangToggleHtml(lang)}
+  {langService.LangToggleHtml(lang)}
 </div>
 
 <div class='tip'>
@@ -316,7 +338,7 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
     </div>
     <div><h1>FIT Fixer</h1></div>
   </div>
-  {Lang.LangToggleHtml(lang)}
+  {langService.LangToggleHtml(lang)}
 </div>
 <h2 style='color:red'>{T("denied.heading")}</h2>
 <p>{T("denied.body")}</p>
@@ -336,31 +358,109 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
     var originalName  = Path.GetFileNameWithoutExtension(file.FileName);
     var extension     = Path.GetExtension(file.FileName);
 
+    var tmpDir = Path.Combine(Path.GetTempPath(), "fiteditor");
+    CleanupTempFiles(tmpDir, TimeSpan.FromDays(7));
+    Directory.CreateDirectory(tmpDir);
+    var uploadId = Guid.NewGuid().ToString("N");
+    var savedUploadName = $"upload_{uploadId}{extension}";
+    var savedUploadPath = Path.Combine(tmpDir, savedUploadName);
+
+    // Save file to temp for potential failed download
+    await using (var sourceStream = file.OpenReadStream())
+    await using (var targetStream = File.Create(savedUploadPath))
+    {
+        await sourceStream.CopyToAsync(targetStream);
+    }
+
+    // Read file into memory for processing to avoid file locks
+    using var memoryStream = new MemoryStream();
+    await using (var readStream = File.OpenRead(savedUploadPath))
+    {
+        await readStream.CopyToAsync(memoryStream);
+    }
+    memoryStream.Position = 0;
+
     FitProcessResult result;
 
     try
     {
-        await using var stream = file.OpenReadStream();
-        result = await fitFixerService.ProcessAsync(stream, file.FileName, maxSpeedKmh, startLat, startLon);
-    }
-    catch (Exception ex)
-    {
+        result = await fitFixerService.ProcessAsync(memoryStream, file.FileName, maxSpeedKmh, startLat, startLon);
+
         await requestLogService.LogAsync(GetConnectionString(), new RequestLog
         {
             Ip = clientIp,
             FileName = file.FileName,
+            FileSizeKb = (int)(file.Length / 1024),
+            TotalPoints = result.TotalPoints,
+            FixedPoints = result.FixedPoints,
+            DroppedTimestamp = result.DroppedTimestamp,
+            DroppedDuplicate = result.DroppedDuplicate,
+            DroppedCorrupt = result.DroppedCorrupt,
+            Success = true,
+            ProcessingMs = (int)sw.ElapsedMilliseconds
+        });
+
+        // Delete the uploaded file after successful processing
+        File.Delete(savedUploadPath);
+    }
+    catch (Exception ex)
+    {
+        var fileNameEscaped = WebUtility.HtmlEncode(file.FileName);
+        var fileNameDisplay = TruncateFileName(file.FileName);
+
+        await requestLogService.LogAsync(GetConnectionString(), new RequestLog
+        {
+            Ip = clientIp,
+            FileName = file.FileName,
+            SavedFileName = savedUploadName,
             FileSizeKb = (int)(file.Length / 1024),
             Success = false,
             ErrorMessage = ex.Message,
             ProcessingMs = (int)sw.ElapsedMilliseconds
         });
 
-        return Results.Problem("Processing failed: " + ex.Message);
+        var errorHtml = $@"
+<html>
+<head>
+<meta charset='utf-8'>
+<title>FIT Fixer — Error</title>
+<style>{SharedCss.Css}</style>
+</head>
+<body>
+
+<div class='page-header'>
+  <div class='page-header-left'>
+    <div class='icon-wrap'>
+      <svg width='16' height='16' viewBox='0 0 16 16' fill='none'>
+        <path d='M8 2v8M5 7l3 3 3-3M3 13h10' stroke='#111' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/>
+      </svg>
+    </div>
+    <div><h1>FIT Fixer</h1></div>
+  </div>
+</div>
+
+<h2 style='color:red'>{T("result.error_heading")}</h2>
+<p>{T("result.error_body")}</p>
+<ul>
+  <li>{T("stats.col_file")}: <span title='{fileNameEscaped}'>{fileNameDisplay}</span></li>
+  <li>{T("stats.col_size")}: {(file.Length / 1024)} KB</li>
+  <li>{T("result.error_message")}: {WebUtility.HtmlEncode(ex.Message)}</li>
+</ul>
+<p>
+  <a class='btn-secondary' href='/?lang={lang}'>{T("result.upload_another")}</a>
+</p>
+{SharedCss.Footer(lang)}
+</body>
+</html>";
+
+        return Results.Content(errorHtml, "text/html; charset=utf-8", statusCode: 500);
     }
 
     sw.Stop();
 
     var outputName = result.OutputName;
+    var outputNameEscaped = WebUtility.HtmlEncode(outputName);
+    var outputNameDisplay = TruncateFileName(outputName);
     var savedFileName = Path.GetFileName(result.OutputPath);
 
     var totalPoints = result.TotalPoints;
@@ -461,11 +561,10 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
       </svg>
     </div>
     <div>
-      <h1>{originalName}{extension}</h1>
+      <h1><span title='{outputNameEscaped}'>{outputNameDisplay}</span></h1>
       <p class='sub'>{string.Format(T("result.sub"), sw.ElapsedMilliseconds)}</p>
     </div>
   </div>
-  {langService.LangToggleHtml(lang)}
 </div>
 
 <p class='section-label'>{T("result.dropped")}</p>
@@ -486,7 +585,7 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
 </div>
 
 <div class='actions'>
-  <a class='btn-primary' href='{downloadUrl}' download>{string.Format(T("result.download"), outputName)}</a>
+  <a class='btn-primary' href='{downloadUrl}' download title='{outputNameEscaped}'>{string.Format(T("result.download"), outputNameDisplay)}</a>
   <a class='btn-secondary' href='/?lang={lang}'>{T("result.upload_another")}</a>
 </div>
 
@@ -512,7 +611,26 @@ app.MapGet("/download", (HttpRequest request) =>
     if (!File.Exists(filePath))
         return Results.NotFound("File not found.");
 
-    var stream = File.OpenRead(filePath);
+    var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 8192, FileOptions.DeleteOnClose);
+    return Results.File(stream, "application/octet-stream", userFileName, enableRangeProcessing: false);
+});
+
+app.MapGet("/download-original", (HttpRequest request) =>
+{
+    var savedFileName = request.Query["file"].ToString();
+    var userFileName = request.Query["name"].ToString();
+
+    if (string.IsNullOrEmpty(savedFileName) || string.IsNullOrEmpty(userFileName))
+        return Results.BadRequest("Missing file or name parameter.");
+
+    if (savedFileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+        return Results.BadRequest("Invalid file name.");
+
+    var filePath = Path.Combine(Path.GetTempPath(), "fiteditor", savedFileName);
+    if (!File.Exists(filePath))
+        return Results.NotFound("File not found.");
+
+    var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 8192, FileOptions.DeleteOnClose);
     return Results.File(stream, "application/octet-stream", userFileName, enableRangeProcessing: false);
 });
 
@@ -527,7 +645,7 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
 
     var summary = requestLogRepository.GetSummary(GetConnectionString());
     var uniqueIps = new Dictionary<string, object?> { ["cnt"] = requestLogRepository.GetUniqueIpCount(GetConnectionString()) };
-    var byCountry = requestLogRepository.GetRequestsByCountry(GetConnectionString());
+    var byCity = requestLogRepository.GetRequestsByCity(GetConnectionString());
     var rows = requestLogRepository.GetLastRequests(GetConnectionString());
 
     static string N(object? v) => v?.ToString() ?? "-";
@@ -536,23 +654,39 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
             ? "<span style='color:green'>✓</span>"
             : "<span style='color:red'>✗</span>";
 
-    var countryRows = string.Concat(byCountry.Select(r =>
-        $"<tr><td>{N(r["country"])}</td><td>{N(r["cnt"])}</td></tr>"));
+    var cityRows = string.Concat(byCity.Select(r =>
+        $"<tr><td>{N(r["city"])}</td><td>{N(r["cnt"])}</td></tr>"));
 
-    var historyRows = string.Concat(rows.Select(r => $@"
+    var historyRows = string.Concat(rows.Select(r => {
+        var saved = N(r["saved_file_name"]);
+        var fileName = N(r["file_name"]);
+        var success = N(r["success"]) == "1";
+        var downloadLink = !success && !string.IsNullOrEmpty(saved) && saved != "-"
+            ? $"<a href='/download-original?file={Uri.EscapeDataString(saved)}&name={Uri.EscapeDataString(fileName)}'>{T("stats.col_download")}</a>"
+            : "-";
+
+        var safeFileName = WebUtility.HtmlEncode(fileName);
+        var displayFileName = fileName == "-" ? "-" : TruncateFileName(fileName);
+        var fileNameCell = fileName == "-"
+            ? "-"
+            : $"<span title='{safeFileName}'>{displayFileName}</span>";
+
+        return $@"
         <tr>
             <td>{N(r["timestamp"])}</td>
             <td>{N(r["ip"])}</td>
             <td>{N(r["country"])}</td>
             <td>{N(r["city"])}</td>
-            <td>{N(r["file_name"])}</td>
+            <td>{fileNameCell}</td>
+            <td>{downloadLink}</td>
             <td>{N(r["file_size_kb"])} KB</td>
             <td>{N(r["total_points"])}</td>
             <td>{N(r["fixed_points"])}</td>
             <td>{N(r["processing_ms"])} ms</td>
             <td>{Badge(r["success"])}</td>
             <td style='color:red;font-size:0.85em'>{N(r["error_message"])}</td>
-        </tr>"));
+        </tr>";
+    }));
 
     var html = $@"
 <html>
@@ -572,7 +706,7 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
     </div>
     <div><h1>FIT Fixer — {T("stats.heading")}</h1></div>
   </div>
-  {Lang.LangToggleHtml(lang)}
+  {langService.LangToggleHtml(lang)}
 </div>
 
 <p style='margin-bottom:20px'><a href='/?lang={lang}' style='color:#666;font-size:13px;text-decoration:none'>{T("stats.back")}</a></p>
@@ -590,10 +724,10 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
 
 <hr/>
 
-<p class='section-label'>{T("stats.by_country")}</p>
+<p class='section-label'>{T("stats.by_city")}</p>
 <table>
-  <tr><th>{T("stats.country")}</th><th>{T("stats.requests")}</th></tr>
-  {countryRows}
+  <tr><th>{T("stats.city")}</th><th>{T("stats.requests")}</th></tr>
+  {cityRows}
 </table>
 
 <hr/>
@@ -603,9 +737,9 @@ app.MapGet("/stats", (HttpRequest request, HttpResponse response, ILanguageServi
   <tr>
     <th>{T("stats.col_time")}</th><th>{T("stats.col_ip")}</th>
     <th>{T("stats.col_country")}</th><th>{T("stats.col_city")}</th>
-    <th>{T("stats.col_file")}</th><th>{T("stats.col_size")}</th>
+    <th>{T("stats.col_file")}</th><th>{T("stats.col_download")}</th><th>{T("stats.col_size")}</th>
     <th>{T("stats.col_points")}</th><th>{T("stats.col_fixed")}</th>
-    <th>{T("stats.col_time2")}</th><th>{T("stats.col_ok")}</th>
+    <th>{T("stats.col_duration")}</th><th>{T("stats.col_ok")}</th>
     <th>{T("stats.col_error")}</th>
   </tr>
   {historyRows}
@@ -631,6 +765,16 @@ app.MapPost("/admin/cleanup-ipv6", (HttpRequest request) =>
     return Results.Ok($"Deleted {count} rows with ::ffff: prefix");
 });
 
+static string TruncateFileName(string name, int maxLen = 36)
+{
+    if (string.IsNullOrEmpty(name) || name.Length <= maxLen)
+        return WebUtility.HtmlEncode(name ?? "-");
+
+    var prefix = name.Substring(0, maxLen / 2 - 1);
+    var suffix = name.Substring(name.Length - (maxLen / 2 - 1));
+    return WebUtility.HtmlEncode(prefix + "…" + suffix);
+}
+
 app.Run();
 
 // ===========================================================================
@@ -643,7 +787,10 @@ app.Run();
 static class SharedCss
 {
     public static string Footer(string lang) => lang == "uk"
-        ? @"<div class='donate-footer'>
+        ? @"<div class='contact-footer'>
+  <p>Контакти: напишіть на <a href='mailto:veiling.sappy0b@icloud.com'>veiling.sappy0b@icloud.com</a>, якщо є питання або пропозиції.</p>
+</div>
+<div class='donate-footer'>
   <a class='donate-banner' href='https://defensivewave.org/' target='_blank' rel='noopener'>
     <div class='donate-banner-left'>
       <div class='donate-flag'>🇺🇦</div>
@@ -655,7 +802,10 @@ static class SharedCss
     <div class='donate-btn'>Задонатити →</div>
   </a>
 </div>"
-        : @"<div class='donate-footer'>
+        : @"<div class='contact-footer'>
+  <p>Contact author by email <a href='mailto:veiling.sappy0b@icloud.com'>veiling.sappy0b@icloud.com</a> for questions or suggestions.</p>
+</div>
+<div class='donate-footer'>
   <a class='donate-banner' href='https://defensivewave.org/' target='_blank' rel='noopener'>
     <div class='donate-banner-left'>
       <div class='donate-flag'>🇺🇦</div>
@@ -729,6 +879,9 @@ static class SharedCss
   .donate-text strong { display: block; font-size: 15px; font-weight: 500; }
   .donate-text span { font-size: 13px; opacity: 0.85; }
   .donate-btn { background: #ffd700; color: #0057b8; font-size: 13px; font-weight: 500; border-radius: 6px; padding: 8px 18px; white-space: nowrap; flex-shrink: 0; }
+  .contact-footer { margin-top: 24px; margin-bottom: 16px; padding: 10px 14px; border: 1px solid #e1e1e1; border-radius: 10px; background: #fafafa; font-size: 13px; color: #333; }
+  .contact-footer a { color: #185fa5; text-decoration: none; }
+  .contact-footer a:hover { text-decoration: underline; }
   .city-wrap { position: relative; display: inline-block; width: 280px; }
   .city-wrap input[type=text] { width: 100%; box-sizing: border-box; }
   .city-suggestions { position: absolute; top: 100%; left: 0; right: 0; background: #fff; border: 1px solid #ccc; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,.1); z-index: 100; display: none; max-height: 220px; overflow-y: auto; margin-top: 2px; }
@@ -743,116 +896,4 @@ static class SharedCss
   .legend-dot.fixed { background: #e53e3e; }";
 }
 
-// ---------------------------------------------------------------------------
-// Lang helpers
-// ---------------------------------------------------------------------------
-static class Lang
-{
-    public static string Detect(HttpRequest req)
-    {
-        var q = req.Query["lang"].ToString();
-        if (q == "uk" || q == "en") return q;
-        if (req.Cookies.TryGetValue("lang", out var c) && (c == "uk" || c == "en")) return c;
-        var al = req.Headers["Accept-Language"].ToString();
-        if (al.StartsWith("uk", StringComparison.OrdinalIgnoreCase)) return "uk";
-        return "en";
-    }
-
-    public static void SetCookie(HttpResponse resp, string lang)
-        => resp.Cookies.Append("lang", lang, new CookieOptions { MaxAge = TimeSpan.FromDays(365), SameSite = SameSiteMode.Lax });
-
-    public static string LangToggleHtml(string current, string path = "/")
-        => $@"<div class='lang-toggle'>
-  <a href='#' class='lang-btn{(current == "en" ? " active" : "")}' onclick='setLang(""en"")'>EN</a>
-  <a href='#' class='lang-btn{(current == "uk" ? " active" : "")}' onclick='setLang(""uk"")'>UA</a>
-</div>
-<script>
-function setLang(l){{
-  document.cookie='lang='+l+';path=/;max-age=31536000;samesite=lax';
-  var url=new URL(window.location.href);
-  url.searchParams.set('lang',l);
-  window.location.href=url.toString();
-}}
-</script>";
-
-    private static readonly Dictionary<string, Dictionary<string, string>> Strings = new()
-    {
-        ["upload.title"]            = new() { ["en"] = "FIT Fixer",                                                       ["uk"] = "FIT Fixer" },
-        ["upload.sub"]              = new() { ["en"] = "Fix GPS glitches in your activity file",                              ["uk"] = "Виправляє GPS-збої у файлі активності" },
-        ["upload.tip"]              = new() { ["en"] = "Upload a <strong>.fit</strong> file recorded by your Garmin or other device. The service detects GPS points that would require exceeding the configured speed limit to reach, and replaces them with the last valid position.",
-                                              ["uk"] = "Завантажте файл <strong>.fit</strong>, записаний вашим Garmin або іншим пристроєм. Сервіс виявляє GPS-точки, для досягнення яких потрібно перевищити задану швидкість, та замінює їх останньою коректною позицією." },
-        ["upload.section"]          = new() { ["en"] = "Upload",                          ["uk"] = "Завантаження" },
-        ["upload.file_label"]       = new() { ["en"] = "FIT file",                        ["uk"] = "FIT-файл" },
-        ["upload.click"]            = new() { ["en"] = "Click to choose a file",          ["uk"] = "Натисніть, щоб вибрати файл" },
-        ["upload.hint"]             = new() { ["en"] = "or drag and drop · .fit · max 5 MB", ["uk"] = "або перетягніть · .fit · макс. 5 МБ" },
-        ["upload.start_label"]      = new() { ["en"] = "Start area",                           ["uk"] = "Регіон старту" },
-        ["upload.start_ph"]         = new() { ["en"] = "City name…",                           ["uk"] = "Назва міста…" },
-        ["upload.start_hint"]       = new() { ["en"] = "First GPS point further than 50 km from this city is treated as a pre-start glitch",
-                                              ["uk"] = "Перша GPS-точка далі 50 км від цього міста вважається збоєм до старту" },
-        ["upload.threshold_label"]  = new() { ["en"] = "Max speed",                            ["uk"] = "Максимальна швидкість" },
-        ["upload.threshold_unit"]   = new() { ["en"] = "km/h",                                 ["uk"] = "км/год" },
-        ["upload.threshold_hint"]   = new() { ["en"] = "Points implying faster travel than this are treated as GPS glitches (default: 70 km/h, range: 5–100)",
-                                              ["uk"] = "Точки, що передбачають швидкість вище цієї, вважаються збоями GPS (за замовчуванням: 70 км/год, діапазон: 5–100)" },
-        ["upload.captcha_label"]    = new() { ["en"] = "Human check — solve to continue", ["uk"] = "Перевірка — вирішіть приклад" },
-        ["upload.captcha_eq"]       = new() { ["en"] = "=",                               ["uk"] = "=" },
-        ["upload.captcha_ph"]       = new() { ["en"] = "?",                               ["uk"] = "?" },
-        ["upload.captcha_err"]      = new() { ["en"] = "Incorrect answer — please try again", ["uk"] = "Неправильна відповідь — спробуйте ще раз" },
-        ["upload.submit"]           = new() { ["en"] = "Upload &amp; Fix",                ["uk"] = "Завантажити та виправити" },
-        ["upload.stats_link"]       = new() { ["en"] = "View stats →",                   ["uk"] = "Статистика →" },
-        ["result.sub"]              = new() { ["en"] = "Completed in {0} ms",             ["uk"] = "Виконано за {0} мс" },
-        ["result.coord_section"]    = new() { ["en"] = "Coordinate stats",                ["uk"] = "Статистика координат" },
-        ["result.total"]            = new() { ["en"] = "Total record points",             ["uk"] = "Всього точок" },
-        ["result.null"]             = new() { ["en"] = "Null coordinates",                ["uk"] = "Порожні координати" },
-        ["result.map_section"]      = new() { ["en"] = "Track map",                           ["uk"] = "Карта треку" },
-        ["result.map_ok"]           = new() { ["en"] = "Original track",                       ["uk"] = "Оригінальний трек" },
-        ["result.map_fixed"]        = new() { ["en"] = "Fixed points",                         ["uk"] = "Виправлені точки" },
-        ["result.map_start"]        = new() { ["en"] = "Start",                                ["uk"] = "Старт" },
-        ["result.map_end"]          = new() { ["en"] = "Finish",                               ["uk"] = "Фініш" },
-        ["result.jump"]             = new() { ["en"] = "Speed glitch >{0} km/h",               ["uk"] = "Збій швидкості >{0} км/год" },
-        ["result.fixed"]            = new() { ["en"] = "Fixed points",                    ["uk"] = "Виправлено точок" },
-        ["result.dropped"]          = new() { ["en"] = "Dropped messages",                ["uk"] = "Відкинуті повідомлення" },
-        ["result.bad_ts"]           = new() { ["en"] = "{0} bad timestamp",               ["uk"] = "{0} некоректна мітка часу" },
-        ["result.dup"]              = new() { ["en"] = "{0} duplicate file_id",           ["uk"] = "{0} дублікат file_id" },
-        ["result.corrupt"]          = new() { ["en"] = "{0} corrupt",                     ["uk"] = "{0} пошкоджених" },
-        ["result.tip"]              = new() { ["en"] = "If uploading the fixed file to Strava fails, try uploading it to <a href='https://www.fitfileviewer.com/' target='_blank'>fitfileviewer.com</a> — it can repair additional issues and help get your activity uploaded.",
-                                              ["uk"] = "Якщо завантаження виправленого файлу до Strava не вдається, спробуйте <a href='https://www.fitfileviewer.com/' target='_blank'>fitfileviewer.com</a> — він може усунути додаткові проблеми." },
-        ["result.download"]         = new() { ["en"] = "Download {0}",                    ["uk"] = "Завантажити {0}" },
-        ["result.upload_another"]   = new() { ["en"] = "Upload another file",             ["uk"] = "Завантажити інший файл" },
-        ["denied.title"]            = new() { ["en"] = "Access Denied",                   ["uk"] = "Доступ заборонено" },
-        ["denied.heading"]          = new() { ["en"] = "Invalid API Key",                 ["uk"] = "Невірний ключ API" },
-        ["denied.body"]             = new() { ["en"] = "The API key you entered is incorrect.", ["uk"] = "Введений ключ API є невірним." },
-        ["denied.back"]             = new() { ["en"] = "← Return to upload page",         ["uk"] = "← Повернутися до завантаження" },
-        ["stats.title"]             = new() { ["en"] = "FIT Fixer — Stats",               ["uk"] = "FIT Fixer — Статистика" },
-        ["stats.heading"]           = new() { ["en"] = "Request Statistics",              ["uk"] = "Статистика запитів" },
-        ["stats.back"]              = new() { ["en"] = "← Upload page",                   ["uk"] = "← Сторінка завантаження" },
-        ["stats.summary"]           = new() { ["en"] = "Summary",                         ["uk"] = "Зведення" },
-        ["stats.total"]             = new() { ["en"] = "Total requests",                  ["uk"] = "Всього запитів" },
-        ["stats.succeeded"]         = new() { ["en"] = "Succeeded",                       ["uk"] = "Успішних" },
-        ["stats.failed"]            = new() { ["en"] = "Failed",                          ["uk"] = "Помилок" },
-        ["stats.avg_ms"]            = new() { ["en"] = "Avg processing time",             ["uk"] = "Сер. час обробки" },
-        ["stats.sum_points"]        = new() { ["en"] = "Total points processed",          ["uk"] = "Всього точок оброблено" },
-        ["stats.sum_fixed"]         = new() { ["en"] = "Total points fixed",              ["uk"] = "Всього точок виправлено" },
-        ["stats.unique_ips"]        = new() { ["en"] = "Unique IPs",                      ["uk"] = "Унікальних IP" },
-        ["stats.by_country"]        = new() { ["en"] = "Requests by country",             ["uk"] = "Запити за країнами" },
-        ["stats.country"]           = new() { ["en"] = "Country",                         ["uk"] = "Країна" },
-        ["stats.requests"]          = new() { ["en"] = "Requests",                        ["uk"] = "Запити" },
-        ["stats.last50"]            = new() { ["en"] = "Last 50 requests",                ["uk"] = "Останні 50 запитів" },
-        ["stats.col_time"]          = new() { ["en"] = "Time (UTC)",                      ["uk"] = "Час (UTC)" },
-        ["stats.col_ip"]            = new() { ["en"] = "IP",                              ["uk"] = "IP" },
-        ["stats.col_country"]       = new() { ["en"] = "Country",                         ["uk"] = "Країна" },
-        ["stats.col_city"]          = new() { ["en"] = "City",                            ["uk"] = "Місто" },
-        ["stats.col_file"]          = new() { ["en"] = "File",                            ["uk"] = "Файл" },
-        ["stats.col_size"]          = new() { ["en"] = "Size",                            ["uk"] = "Розмір" },
-        ["stats.col_points"]        = new() { ["en"] = "Points",                          ["uk"] = "Точки" },
-        ["stats.col_fixed"]         = new() { ["en"] = "Fixed",                           ["uk"] = "Виправл." },
-        ["stats.col_time2"]         = new() { ["en"] = "Time",                            ["uk"] = "Час" },
-        ["stats.col_ok"]            = new() { ["en"] = "OK",                              ["uk"] = "OK" },
-        ["stats.col_error"]         = new() { ["en"] = "Error",                           ["uk"] = "Помилка" },
-    };
-
-    public static string T(string key, string lang)
-        => Strings.TryGetValue(key, out var d)
-            ? (d.TryGetValue(lang, out var s) ? s : d["en"])
-            : key;
-}
 
