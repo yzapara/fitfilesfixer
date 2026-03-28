@@ -365,18 +365,26 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
     var savedUploadName = $"upload_{uploadId}{extension}";
     var savedUploadPath = Path.Combine(tmpDir, savedUploadName);
 
+    // Save file to temp for potential failed download
     await using (var sourceStream = file.OpenReadStream())
     await using (var targetStream = File.Create(savedUploadPath))
     {
         await sourceStream.CopyToAsync(targetStream);
     }
 
+    // Read file into memory for processing to avoid file locks
+    using var memoryStream = new MemoryStream();
+    await using (var readStream = File.OpenRead(savedUploadPath))
+    {
+        await readStream.CopyToAsync(memoryStream);
+    }
+    memoryStream.Position = 0;
+
     FitProcessResult result;
 
     try
     {
-        await using var processStream = File.OpenRead(savedUploadPath);
-        result = await fitFixerService.ProcessAsync(processStream, file.FileName, maxSpeedKmh, startLat, startLon);
+        result = await fitFixerService.ProcessAsync(memoryStream, file.FileName, maxSpeedKmh, startLat, startLon);
 
         await requestLogService.LogAsync(GetConnectionString(), new RequestLog
         {
