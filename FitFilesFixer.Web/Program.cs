@@ -434,7 +434,6 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
     </div>
     <div><h1>FIT Fixer</h1></div>
   </div>
-  {Lang.LangToggleHtml(lang)}
 </div>
 
 <h2 style='color:red'>{T("result.error_heading")}</h2>
@@ -562,7 +561,6 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
       <p class='sub'>{string.Format(T("result.sub"), sw.ElapsedMilliseconds)}</p>
     </div>
   </div>
-  {langService.LangToggleHtml(lang)}
 </div>
 
 <p class='section-label'>{T("result.dropped")}</p>
