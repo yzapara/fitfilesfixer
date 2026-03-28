@@ -447,7 +447,6 @@ app.MapPost("/process", async (HttpRequest request, HttpResponse response, IFitF
 <p>
   <a class='btn-primary' href='/download-original?file={Uri.EscapeDataString(savedUploadName)}&name={Uri.EscapeDataString(file.FileName)}'>{T("result.download_original")}</a>
   <a class='btn-secondary' href='/?lang={lang}'>{T("result.upload_another")}</a>
-  <a class='btn-secondary' href='/stats?lang={lang}'>{T("upload.stats_link")}</a>
 </p>
 {SharedCss.Footer(lang)}
 </body>
